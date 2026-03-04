@@ -1,0 +1,41 @@
+import asyncio
+import random
+from rate_limiter import RateLimiter
+from trace import trace
+
+
+class BackoffScheduler:
+    """Strategy 1: No global queue. Each agent retries with exponential backoff."""
+
+    def __init__(self, limiter: RateLimiter):
+        self.limiter = limiter
+
+    def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def submit(self, coro_factory, estimated_tokens: int,
+                     agent_id: str, call_type: str, detail: str = ""):
+        """Submit a call. Retries with exponential backoff if rate limited."""
+        backoff = 1.0
+        retries = 0
+
+        while True:
+            allowed = await self.limiter.try_acquire(estimated_tokens)
+            if allowed:
+                call = trace.start_call(agent_id, call_type, detail,
+                                        retries=retries)
+                result = await coro_factory()
+                trace.end_call(call)
+                return result
+
+            # Rate limited — backoff with jitter
+            jitter = random.uniform(0, backoff * 0.5)
+            wait = backoff + jitter
+            retries += 1
+            print(f"  [BACKOFF] {agent_id}:{call_type} rate limited, "
+                  f"retry #{retries} in {wait:.2f}s")
+            await asyncio.sleep(wait)
+            backoff = min(backoff * 2, 30.0)
