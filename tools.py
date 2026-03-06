@@ -48,7 +48,7 @@ TOOL_SCHEMAS = [
 ]
 
 
-async def web_search(query: str, agent_id: str) -> str:
+async def web_search(query: str, agent_id: str, group_id: str = None) -> str:
     resp = await llm_call(
         messages=[
             {"role": "system", "content": "You simulate a web search engine. Given a query, return 3-5 realistic search result snippets with titles and brief excerpts. Be informative and factual."},
@@ -57,11 +57,12 @@ async def web_search(query: str, agent_id: str) -> str:
         agent_id=agent_id,
         call_type="web_search",
         detail=query[:40],
+        group_id=group_id,
     )
     return resp.choices[0].message.content
 
 
-async def summarize(text: str, agent_id: str) -> str:
+async def summarize(text: str, agent_id: str, group_id: str = None) -> str:
     resp = await llm_call(
         messages=[
             {"role": "system", "content": "Summarize the following text into concise key points."},
@@ -70,11 +71,12 @@ async def summarize(text: str, agent_id: str) -> str:
         agent_id=agent_id,
         call_type="summarize",
         detail=f"len={len(text)}",
+        group_id=group_id,
     )
     return resp.choices[0].message.content
 
 
-async def analyze(text: str, question: str, agent_id: str) -> str:
+async def analyze(text: str, question: str, agent_id: str, group_id: str = None) -> str:
     resp = await llm_call(
         messages=[
             {"role": "system", "content": "Analyze the provided text to answer the given question. Be thorough and specific."},
@@ -83,17 +85,18 @@ async def analyze(text: str, question: str, agent_id: str) -> str:
         agent_id=agent_id,
         call_type="analyze",
         detail=question[:40],
+        group_id=group_id,
     )
     return resp.choices[0].message.content
 
 
-async def execute_tool(name: str, arguments: str, agent_id: str) -> str:
+async def execute_tool(name: str, arguments: str, agent_id: str, group_id: str = None) -> str:
     args = json.loads(arguments)
     if name == "web_search":
-        return await web_search(args["query"], agent_id)
+        return await web_search(args["query"], agent_id, group_id=group_id)
     elif name == "summarize":
-        return await summarize(args["text"], agent_id)
+        return await summarize(args["text"], agent_id, group_id=group_id)
     elif name == "analyze":
-        return await analyze(args["text"], args["question"], agent_id)
+        return await analyze(args["text"], args["question"], agent_id, group_id=group_id)
     else:
         return f"Unknown tool: {name}"

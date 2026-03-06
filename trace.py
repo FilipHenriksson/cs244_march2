@@ -129,5 +129,12 @@ class Trace:
         print(f"{'='*70}\n")
 
 
+    def reset(self):
+        """Clear all call history for a fresh run."""
+        self.calls.clear()
+        self._next_id = 0
+        self.t0 = time.time()
+
+
 # Global trace instance
 trace = Trace()

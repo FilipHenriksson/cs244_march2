@@ -24,7 +24,7 @@ def estimate_tokens(messages, **kwargs) -> int:
 
 
 async def llm_call(messages, agent_id: str, call_type: str,
-                   detail: str = "", **kwargs):
+                   detail: str = "", group_id: str = None, **kwargs):
     """Single entry point for all LLM calls. Routes through the active scheduler."""
     est_tokens = estimate_tokens(messages, **kwargs)
 
@@ -41,6 +41,7 @@ async def llm_call(messages, agent_id: str, call_type: str,
 
     response = await _scheduler.submit(
         coro_factory, est_tokens, agent_id, call_type, detail,
+        group_id=group_id,
     )
 
     # Post-call: record real token usage

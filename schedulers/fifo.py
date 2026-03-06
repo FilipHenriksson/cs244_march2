@@ -23,8 +23,15 @@ class FIFOScheduler:
             except asyncio.CancelledError:
                 pass
 
+    def register_group(self, group_id: str, size: int):
+        pass
+
+    def deregister_member(self, group_id: str):
+        pass
+
     async def submit(self, coro_factory, estimated_tokens: int,
-                     agent_id: str, call_type: str, detail: str = ""):
+                     agent_id: str, call_type: str, detail: str = "",
+                     group_id: str = None):
         """Enqueue a call. Returns result when the call completes."""
         future = asyncio.get_event_loop().create_future()
         self._enqueue_counter += 1

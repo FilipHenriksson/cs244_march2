@@ -40,6 +40,11 @@ class RateLimiter:
             self._token_log.append((now, estimated_tokens))
             return True
 
+    def reset(self):
+        """Clear sliding window state for a fresh run."""
+        self._request_times.clear()
+        self._token_log.clear()
+
     async def wait_time(self) -> float:
         """Estimate seconds until capacity might free up."""
         async with self._lock:

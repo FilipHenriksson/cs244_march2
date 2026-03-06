@@ -4,7 +4,8 @@ from tools import TOOL_SCHEMAS, execute_tool
 MAX_TOOL_ROUNDS = 3
 
 
-async def run_agent(sub_question: str, agent_id: int, session_id: int = 0) -> str:
+async def run_agent(sub_question: str, agent_id: int, session_id: int = 0,
+                    group_id: str = None) -> str:
     """Run a single research agent that can use tools in a loop."""
     aid = f"s{session_id}:a{agent_id}"
 
@@ -27,6 +28,7 @@ async def run_agent(sub_question: str, agent_id: int, session_id: int = 0) -> st
             agent_id=aid,
             call_type="agent_turn",
             detail=f"round-{round_num}",
+            group_id=group_id,
             tools=TOOL_SCHEMAS,
         )
         msg = resp.choices[0].message
@@ -40,6 +42,7 @@ async def run_agent(sub_question: str, agent_id: int, session_id: int = 0) -> st
                 tool_call.function.name,
                 tool_call.function.arguments,
                 aid,
+                group_id=group_id,
             )
             messages.append({
                 "role": "tool",
@@ -53,5 +56,6 @@ async def run_agent(sub_question: str, agent_id: int, session_id: int = 0) -> st
         agent_id=aid,
         call_type="agent_turn",
         detail="final",
+        group_id=group_id,
     )
     return resp.choices[0].message.content

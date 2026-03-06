@@ -16,8 +16,15 @@ class BackoffScheduler:
     async def stop(self):
         pass
 
+    def register_group(self, group_id: str, size: int):
+        pass
+
+    def deregister_member(self, group_id: str):
+        pass
+
     async def submit(self, coro_factory, estimated_tokens: int,
-                     agent_id: str, call_type: str, detail: str = ""):
+                     agent_id: str, call_type: str, detail: str = "",
+                     group_id: str = None):
         """Submit a call. Retries with exponential backoff if rate limited."""
         backoff = 1.0
         retries = 0
