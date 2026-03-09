@@ -59,11 +59,17 @@ class SJFScheduler:
             call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
                                     estimated_tokens=est_tokens)
-            asyncio.create_task(self._run(coro_factory, future, call))
+            asyncio.create_task(self._run(coro_factory, future, call, est_tokens))
 
-    async def _run(self, coro_factory, future, call):
+    async def _run(self, coro_factory, future, call, est_tokens: int):
         try:
             result = await coro_factory()
+            if hasattr(result, "usage") and result.usage is not None:
+                await self.limiter.record_actual_usage(
+                    result.usage.prompt_tokens,
+                    result.usage.completion_tokens,
+                    est_tokens,
+                )
             trace.end_call(call)
             future.set_result(result)
         except Exception as e:

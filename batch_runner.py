@@ -10,7 +10,7 @@ from prompts import RESEARCH_PROMPTS
 from orchestrator import orchestrate
 from rate_limiter import RateLimiter
 from schedulers import get_scheduler
-from llm import set_scheduler
+from llm import set_scheduler, set_max_tokens
 from trace import trace
 import cost_tracker as ct
 from cost_tracker import init_cost_tracker, CostLimitExceeded
@@ -154,6 +154,8 @@ async def main():
                         help="Rate limit: tokens per minute (default: 200000)")
     parser.add_argument("--cost-limit", type=float, default=20.0,
                         help="Hard cost cap in USD (default: 20.0)")
+    parser.add_argument("--max-tokens", type=int, default=1024,
+                        help="Max tokens per completion (default: 1024)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for workload generation (default: 42)")
     args = parser.parse_args()
@@ -164,6 +166,7 @@ async def main():
         schedulers = args.schedulers
     else:
         schedulers = [args.scheduler]
+    set_max_tokens(args.max_tokens)
     limiter = RateLimiter(rpm=args.rpm, tpm=args.tpm)
 
     # Pre-generate workload once — all schedulers get identical prompts & arrivals
@@ -173,7 +176,7 @@ async def main():
     total_sessions = args.sessions * len(schedulers)
     print(f"Runner: {len(schedulers)} scheduler(s) x {args.sessions} sessions "
           f"= {total_sessions} total")
-    print(f"Schedulers: {', '.join(schedulers)} | RPM: {args.rpm} | TPM: {args.tpm}")
+    print(f"Schedulers: {', '.join(schedulers)} | RPM: {args.rpm} | TPM: {args.tpm} | max_tokens: {args.max_tokens}")
     print(f"Arrivals: every {args.stagger}s ({args.stagger_mode}) | "
           f"Cost limit: ${args.cost_limit:.2f}")
     print(f"Seed: {args.seed}")

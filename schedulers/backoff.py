@@ -36,6 +36,12 @@ class BackoffScheduler:
                 call = trace.start_call(agent_id, call_type, detail,
                                         retries=retries)
                 result = await coro_factory()
+                if hasattr(result, "usage") and result.usage is not None:
+                    await self.limiter.record_actual_usage(
+                        result.usage.prompt_tokens,
+                        result.usage.completion_tokens,
+                        estimated_tokens,
+                    )
                 trace.end_call(call)
                 return result
 

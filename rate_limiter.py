@@ -40,6 +40,14 @@ class RateLimiter:
             self._token_log.append((now, estimated_tokens))
             return True
 
+    async def record_actual_usage(self, prompt_tokens: int, completion_tokens: int,
+                                  estimated_tokens: int) -> None:
+        """Adjust token count after a request completes with actual usage."""
+        delta = (prompt_tokens + completion_tokens) - estimated_tokens
+        if delta != 0:
+            async with self._lock:
+                self._token_log.append((time.time(), delta))
+
     def reset(self):
         """Clear sliding window state for a fresh run."""
         self._request_times.clear()

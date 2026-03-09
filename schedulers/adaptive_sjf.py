@@ -142,12 +142,18 @@ class AdaptiveSJFScheduler:
             call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
                                     estimated_tokens=est_tokens)
-            asyncio.create_task(self._run(coro_factory, future, call, tracking_key))
+            asyncio.create_task(self._run(coro_factory, future, call, tracking_key, est_tokens))
 
-    async def _run(self, coro_factory, future, call, tracking_key: str):
+    async def _run(self, coro_factory, future, call, tracking_key: str, est_tokens: int):
         try:
             t0 = time.time()
             result = await coro_factory()
+            if hasattr(result, "usage") and result.usage is not None:
+                await self.limiter.record_actual_usage(
+                    result.usage.prompt_tokens,
+                    result.usage.completion_tokens,
+                    est_tokens,
+                )
             self._record_duration(tracking_key, time.time() - t0)
             trace.end_call(call)
             future.set_result(result)
