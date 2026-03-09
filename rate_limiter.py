@@ -31,48 +31,39 @@ class RateLimiter:
     def _current_tpm(self) -> int:
         return sum(t for _, t in self._token_log)
 
-    async def try_acquire(self, estimated_tokens: int) -> tuple[bool, float | None]:
-        """Try to acquire capacity. Returns (True, acquire_time) if allowed, (False, None) if rate limited.
-        Pass acquire_time to record_actual_usage so estimate and delta are pruned together."""
+    async def try_acquire(self, estimated_tokens: int) -> float | None:
+        """Try to acquire capacity. Returns acquire timestamp if allowed, None if rate limited."""
         async with self._lock:
             now = time.time()
             self._prune(now)
-            rpm_now = self._current_rpm()
-            tpm_now = self._current_tpm()
-            if rpm_now >= self.rpm:
-                log.info("[RATELIMIT] acquire denied (RPM): est=%d, rpm=%d/%d, tpm=%d/%d",
-                         estimated_tokens, rpm_now, self.rpm, tpm_now, self.tpm)
-                return False, None
-            if tpm_now + estimated_tokens > self.tpm:
-                log.info("[RATELIMIT] acquire denied (TPM): est=%d, rpm=%d/%d, tpm=%d/%d",
-                         estimated_tokens, rpm_now, self.rpm, tpm_now, self.tpm)
-                return False, None
+            if self._current_rpm() >= self.rpm:
+                return None
+            if self._current_tpm() + estimated_tokens > self.tpm:
+                return None
             self._request_times.append(now)
             self._token_log.append((now, estimated_tokens))
-            return True, now
+            return now
 
     async def record_actual_usage(self, prompt_tokens: int, completion_tokens: int,
-                                  estimated_tokens: int, acquire_time: float | None = None) -> None:
+                                  estimated_tokens: int,
+                                  acquire_time: float) -> None:
         """Adjust token count after a request completes with actual usage.
-        Use acquire_time (from try_acquire) so estimate and delta share the same timestamp and are pruned together."""
-        actual = prompt_tokens + completion_tokens
-        delta = actual - estimated_tokens
+
+        Uses the original acquire_time so the correction expires together
+        with the estimate, preventing negative _current_tpm() windows.
+        """
+        delta = (prompt_tokens + completion_tokens) - estimated_tokens
         if delta != 0:
             async with self._lock:
-                ts = acquire_time if acquire_time is not None else time.time()
-                self._token_log.append((ts, delta))
-                tpm_now = self._current_tpm()
-                log.info("[RATELIMIT] actual_usage: prompt=%d completion=%d actual=%d "
-                         "est=%d delta=%+d tpm_now=%d",
-                         prompt_tokens, completion_tokens, actual, estimated_tokens, delta, tpm_now)
+                self._token_log.append((acquire_time, delta))
 
     def reset(self):
         """Clear sliding window state for a fresh run."""
         self._request_times.clear()
         self._token_log.clear()
 
-    async def wait_time(self) -> float:
-        """Estimate seconds until capacity might free up."""
+    async def wait_time(self, estimated_tokens: int = 0) -> float:
+        """Estimate seconds until capacity might free up for a request of the given size."""
         async with self._lock:
             now = time.time()
             self._prune(now)
@@ -80,7 +71,8 @@ class RateLimiter:
             if self._current_rpm() >= self.rpm:
                 oldest = self._request_times[0]
                 waits.append(oldest + 60.0 - now)
-            if self._current_tpm() >= self.tpm and self._token_log:
-                oldest_ts = min(ts for ts, _ in self._token_log)
-                waits.append(oldest_ts + 60.0 - now)
+            if self._current_tpm() + estimated_tokens > self.tpm:
+                if self._token_log:
+                    oldest_tok = self._token_log[0][0]
+                    waits.append(oldest_tok + 60.0 - now)
             return max(waits) if waits else 0.0
