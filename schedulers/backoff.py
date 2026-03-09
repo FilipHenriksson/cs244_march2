@@ -31,8 +31,8 @@ class BackoffScheduler:
         retries = 0
 
         while True:
-            acquire_time = await self.limiter.try_acquire(estimated_tokens)
-            if acquire_time is not None:
+            allowed = await self.limiter.try_acquire(estimated_tokens)
+            if allowed:
                 call = trace.start_call(agent_id, call_type, detail,
                                         retries=retries)
                 try:
@@ -42,13 +42,12 @@ class BackoffScheduler:
                             result.usage.prompt_tokens,
                             result.usage.completion_tokens,
                             estimated_tokens,
-                            acquire_time,
                         )
                     trace.end_call(call)
                     return result
                 except Exception:
                     await self.limiter.record_actual_usage(
-                        0, 0, estimated_tokens, acquire_time)
+                        0, 0, estimated_tokens)
                     trace.end_call(call)
                     raise
 

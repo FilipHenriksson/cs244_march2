@@ -164,6 +164,14 @@ async def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     for _name in ("openai", "httpx", "httpcore"):
         logging.getLogger(_name).setLevel(logging.WARNING)
+    # Prevent duplicate rate limit logs from propagation
+    rl_log = logging.getLogger("rate_limiter")
+    rl_log.propagate = False
+    if not rl_log.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("%(message)s"))
+        rl_log.addHandler(h)
+        rl_log.setLevel(logging.INFO)
 
     if args.all_schedulers:
         schedulers = ALL_SCHEDULERS
