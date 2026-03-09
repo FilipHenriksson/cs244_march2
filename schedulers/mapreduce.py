@@ -101,8 +101,12 @@ class MapReduceScheduler:
             (coro_factory, est_tokens, future,
              agent_id, call_type, detail, position, group_id) = item
 
-            while not await self.limiter.try_acquire(est_tokens):
-                wait = await self.limiter.wait_time()
+            acquire_time = None
+            while True:
+                acquire_time = await self.limiter.try_acquire(est_tokens)
+                if acquire_time is not None:
+                    break
+                wait = await self.limiter.wait_time(est_tokens)
                 wait = max(wait, 0.1)
                 pri = self._compute_priority(group_id)
                 print(f"  [MR] queue waiting {wait:.2f}s for capacity "
@@ -117,13 +121,18 @@ class MapReduceScheduler:
                  agent_id, call_type, detail, position, group_id) = item
                 idx = new_idx
 
+            if acquire_time is None:
+                continue
+
             self._pending.pop(idx)
             call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
                                     estimated_tokens=est_tokens)
-            asyncio.create_task(self._run(coro_factory, future, call, est_tokens))
+            asyncio.create_task(
+                self._run(coro_factory, future, call, est_tokens, acquire_time))
 
-    async def _run(self, coro_factory, future, call, est_tokens: int):
+    async def _run(self, coro_factory, future, call, est_tokens: int,
+                   acquire_time: float):
         try:
             result = await coro_factory()
             if hasattr(result, "usage") and result.usage is not None:
@@ -131,9 +140,12 @@ class MapReduceScheduler:
                     result.usage.prompt_tokens,
                     result.usage.completion_tokens,
                     est_tokens,
+                    acquire_time,
                 )
             trace.end_call(call)
             future.set_result(result)
         except Exception as e:
+            await self.limiter.record_actual_usage(
+                0, 0, est_tokens, acquire_time)
             trace.end_call(call)
             future.set_exception(e)

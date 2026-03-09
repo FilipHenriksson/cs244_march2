@@ -27,34 +27,39 @@ class RateLimiter:
     def _current_tpm(self) -> int:
         return sum(t for _, t in self._token_log)
 
-    async def try_acquire(self, estimated_tokens: int) -> bool:
-        """Try to acquire capacity. Returns True if allowed, False if rate limited."""
+    async def try_acquire(self, estimated_tokens: int) -> float | None:
+        """Try to acquire capacity. Returns acquire timestamp if allowed, None if rate limited."""
         async with self._lock:
             now = time.time()
             self._prune(now)
             if self._current_rpm() >= self.rpm:
-                return False
+                return None
             if self._current_tpm() + estimated_tokens > self.tpm:
-                return False
+                return None
             self._request_times.append(now)
             self._token_log.append((now, estimated_tokens))
-            return True
+            return now
 
     async def record_actual_usage(self, prompt_tokens: int, completion_tokens: int,
-                                  estimated_tokens: int) -> None:
-        """Adjust token count after a request completes with actual usage."""
+                                  estimated_tokens: int,
+                                  acquire_time: float) -> None:
+        """Adjust token count after a request completes with actual usage.
+
+        Uses the original acquire_time so the correction expires together
+        with the estimate, preventing negative _current_tpm() windows.
+        """
         delta = (prompt_tokens + completion_tokens) - estimated_tokens
         if delta != 0:
             async with self._lock:
-                self._token_log.append((time.time(), delta))
+                self._token_log.append((acquire_time, delta))
 
     def reset(self):
         """Clear sliding window state for a fresh run."""
         self._request_times.clear()
         self._token_log.clear()
 
-    async def wait_time(self) -> float:
-        """Estimate seconds until capacity might free up."""
+    async def wait_time(self, estimated_tokens: int = 0) -> float:
+        """Estimate seconds until capacity might free up for a request of the given size."""
         async with self._lock:
             now = time.time()
             self._prune(now)
@@ -62,7 +67,8 @@ class RateLimiter:
             if self._current_rpm() >= self.rpm:
                 oldest = self._request_times[0]
                 waits.append(oldest + 60.0 - now)
-            if self._current_tpm() >= self.tpm:
-                oldest_tok = self._token_log[0][0]
-                waits.append(oldest_tok + 60.0 - now)
+            if self._current_tpm() + estimated_tokens > self.tpm:
+                if self._token_log:
+                    oldest_tok = self._token_log[0][0]
+                    waits.append(oldest_tok + 60.0 - now)
             return max(waits) if waits else 0.0

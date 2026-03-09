@@ -31,19 +31,26 @@ class BackoffScheduler:
         retries = 0
 
         while True:
-            allowed = await self.limiter.try_acquire(estimated_tokens)
-            if allowed:
+            acquire_time = await self.limiter.try_acquire(estimated_tokens)
+            if acquire_time is not None:
                 call = trace.start_call(agent_id, call_type, detail,
                                         retries=retries)
-                result = await coro_factory()
-                if hasattr(result, "usage") and result.usage is not None:
+                try:
+                    result = await coro_factory()
+                    if hasattr(result, "usage") and result.usage is not None:
+                        await self.limiter.record_actual_usage(
+                            result.usage.prompt_tokens,
+                            result.usage.completion_tokens,
+                            estimated_tokens,
+                            acquire_time,
+                        )
+                    trace.end_call(call)
+                    return result
+                except Exception:
                     await self.limiter.record_actual_usage(
-                        result.usage.prompt_tokens,
-                        result.usage.completion_tokens,
-                        estimated_tokens,
-                    )
-                trace.end_call(call)
-                return result
+                        0, 0, estimated_tokens, acquire_time)
+                    trace.end_call(call)
+                    raise
 
             # Rate limited — backoff with jitter
             jitter = self._rng.uniform(0, backoff * 0.5)

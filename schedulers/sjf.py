@@ -49,8 +49,11 @@ class SJFScheduler:
             est_tokens = priority[0]
 
             # Wait until rate limiter allows
-            while not await self.limiter.try_acquire(est_tokens):
-                wait = await self.limiter.wait_time()
+            while True:
+                acquire_time = await self.limiter.try_acquire(est_tokens)
+                if acquire_time is not None:
+                    break
+                wait = await self.limiter.wait_time(est_tokens)
                 wait = max(wait, 0.1)
                 print(f"  [SJF] queue waiting {wait:.2f}s for capacity "
                       f"(next: {agent_id}:{call_type}, {est_tokens} tokens)")
@@ -59,9 +62,11 @@ class SJFScheduler:
             call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
                                     estimated_tokens=est_tokens)
-            asyncio.create_task(self._run(coro_factory, future, call, est_tokens))
+            asyncio.create_task(
+                self._run(coro_factory, future, call, est_tokens, acquire_time))
 
-    async def _run(self, coro_factory, future, call, est_tokens: int):
+    async def _run(self, coro_factory, future, call, est_tokens: int,
+                   acquire_time: float):
         try:
             result = await coro_factory()
             if hasattr(result, "usage") and result.usage is not None:
@@ -69,9 +74,12 @@ class SJFScheduler:
                     result.usage.prompt_tokens,
                     result.usage.completion_tokens,
                     est_tokens,
+                    acquire_time,
                 )
             trace.end_call(call)
             future.set_result(result)
         except Exception as e:
+            await self.limiter.record_actual_usage(
+                0, 0, est_tokens, acquire_time)
             trace.end_call(call)
             future.set_exception(e)
