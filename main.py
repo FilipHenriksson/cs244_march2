@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import logging
 import random
 
 from dotenv import load_dotenv
@@ -29,6 +30,10 @@ async def main():
     parser.add_argument("--cost-limit", type=float, default=15.0,
                         help="Hard cost cap in USD (default: 15.0)")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    for _name in ("openai", "httpx", "httpcore"):
+        logging.getLogger(_name).setLevel(logging.WARNING)
 
     if args.prompt:
         prompt = args.prompt

@@ -121,7 +121,11 @@ class AdaptiveSJFScheduler:
              agent_id, call_type, detail, position,
              group_id, tracking_key) = item
 
-            while not await self.limiter.try_acquire(est_tokens):
+            allowed, acquire_ts = False, None
+            while True:
+                allowed, acquire_ts = await self.limiter.try_acquire(est_tokens)
+                if allowed:
+                    break
                 wait = await self.limiter.wait_time()
                 wait = max(wait, 0.1)
                 pred = self._predicted_duration(tracking_key)
@@ -142,9 +146,9 @@ class AdaptiveSJFScheduler:
             call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
                                     estimated_tokens=est_tokens)
-            asyncio.create_task(self._run(coro_factory, future, call, tracking_key, est_tokens))
+            asyncio.create_task(self._run(coro_factory, future, call, tracking_key, est_tokens, acquire_ts))
 
-    async def _run(self, coro_factory, future, call, tracking_key: str, est_tokens: int):
+    async def _run(self, coro_factory, future, call, tracking_key: str, est_tokens: int, acquire_ts: float | None):
         try:
             t0 = time.time()
             result = await coro_factory()
@@ -153,6 +157,7 @@ class AdaptiveSJFScheduler:
                     result.usage.prompt_tokens,
                     result.usage.completion_tokens,
                     est_tokens,
+                    acquire_time=acquire_ts,
                 )
             self._record_duration(tracking_key, time.time() - t0)
             trace.end_call(call)

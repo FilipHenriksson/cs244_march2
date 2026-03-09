@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import logging
 import random
 import time
 
@@ -159,6 +160,10 @@ async def main():
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for workload generation (default: 42)")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    for _name in ("openai", "httpx", "httpcore"):
+        logging.getLogger(_name).setLevel(logging.WARNING)
 
     if args.all_schedulers:
         schedulers = ALL_SCHEDULERS

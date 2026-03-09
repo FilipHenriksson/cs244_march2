@@ -49,7 +49,11 @@ class SJFScheduler:
             est_tokens = priority[0]
 
             # Wait until rate limiter allows
-            while not await self.limiter.try_acquire(est_tokens):
+            allowed, acquire_ts = False, None
+            while True:
+                allowed, acquire_ts = await self.limiter.try_acquire(est_tokens)
+                if allowed:
+                    break
                 wait = await self.limiter.wait_time()
                 wait = max(wait, 0.1)
                 print(f"  [SJF] queue waiting {wait:.2f}s for capacity "
@@ -59,9 +63,9 @@ class SJFScheduler:
             call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
                                     estimated_tokens=est_tokens)
-            asyncio.create_task(self._run(coro_factory, future, call, est_tokens))
+            asyncio.create_task(self._run(coro_factory, future, call, est_tokens, acquire_ts))
 
-    async def _run(self, coro_factory, future, call, est_tokens: int):
+    async def _run(self, coro_factory, future, call, est_tokens: int, acquire_ts: float | None):
         try:
             result = await coro_factory()
             if hasattr(result, "usage") and result.usage is not None:
@@ -69,6 +73,7 @@ class SJFScheduler:
                     result.usage.prompt_tokens,
                     result.usage.completion_tokens,
                     est_tokens,
+                    acquire_time=acquire_ts,
                 )
             trace.end_call(call)
             future.set_result(result)

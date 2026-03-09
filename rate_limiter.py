@@ -1,6 +1,9 @@
 import asyncio
+import logging
 import time
 from collections import deque
+
+log = logging.getLogger("rate_limiter")
 
 
 class RateLimiter:
@@ -18,8 +21,9 @@ class RateLimiter:
         cutoff = now - 60.0
         while self._request_times and self._request_times[0] < cutoff:
             self._request_times.popleft()
-        while self._token_log and self._token_log[0][0] < cutoff:
-            self._token_log.popleft()
+        # Token log has (est, delta) with possibly out-of-order timestamps (deltas use acquire_ts).
+        # Remove ALL entries with ts < cutoff, not just from the left.
+        self._token_log = deque((ts, t) for ts, t in self._token_log if ts >= cutoff)
 
     def _current_rpm(self) -> int:
         return len(self._request_times)
@@ -27,26 +31,40 @@ class RateLimiter:
     def _current_tpm(self) -> int:
         return sum(t for _, t in self._token_log)
 
-    async def try_acquire(self, estimated_tokens: int) -> bool:
-        """Try to acquire capacity. Returns True if allowed, False if rate limited."""
+    async def try_acquire(self, estimated_tokens: int) -> tuple[bool, float | None]:
+        """Try to acquire capacity. Returns (True, acquire_time) if allowed, (False, None) if rate limited.
+        Pass acquire_time to record_actual_usage so estimate and delta are pruned together."""
         async with self._lock:
             now = time.time()
             self._prune(now)
-            if self._current_rpm() >= self.rpm:
-                return False
-            if self._current_tpm() + estimated_tokens > self.tpm:
-                return False
+            rpm_now = self._current_rpm()
+            tpm_now = self._current_tpm()
+            if rpm_now >= self.rpm:
+                log.info("[RATELIMIT] acquire denied (RPM): est=%d, rpm=%d/%d, tpm=%d/%d",
+                         estimated_tokens, rpm_now, self.rpm, tpm_now, self.tpm)
+                return False, None
+            if tpm_now + estimated_tokens > self.tpm:
+                log.info("[RATELIMIT] acquire denied (TPM): est=%d, rpm=%d/%d, tpm=%d/%d",
+                         estimated_tokens, rpm_now, self.rpm, tpm_now, self.tpm)
+                return False, None
             self._request_times.append(now)
             self._token_log.append((now, estimated_tokens))
-            return True
+            return True, now
 
     async def record_actual_usage(self, prompt_tokens: int, completion_tokens: int,
-                                  estimated_tokens: int) -> None:
-        """Adjust token count after a request completes with actual usage."""
-        delta = (prompt_tokens + completion_tokens) - estimated_tokens
+                                  estimated_tokens: int, acquire_time: float | None = None) -> None:
+        """Adjust token count after a request completes with actual usage.
+        Use acquire_time (from try_acquire) so estimate and delta share the same timestamp and are pruned together."""
+        actual = prompt_tokens + completion_tokens
+        delta = actual - estimated_tokens
         if delta != 0:
             async with self._lock:
-                self._token_log.append((time.time(), delta))
+                ts = acquire_time if acquire_time is not None else time.time()
+                self._token_log.append((ts, delta))
+                tpm_now = self._current_tpm()
+                log.info("[RATELIMIT] actual_usage: prompt=%d completion=%d actual=%d "
+                         "est=%d delta=%+d tpm_now=%d",
+                         prompt_tokens, completion_tokens, actual, estimated_tokens, delta, tpm_now)
 
     def reset(self):
         """Clear sliding window state for a fresh run."""
@@ -62,7 +80,7 @@ class RateLimiter:
             if self._current_rpm() >= self.rpm:
                 oldest = self._request_times[0]
                 waits.append(oldest + 60.0 - now)
-            if self._current_tpm() >= self.tpm:
-                oldest_tok = self._token_log[0][0]
-                waits.append(oldest_tok + 60.0 - now)
+            if self._current_tpm() >= self.tpm and self._token_log:
+                oldest_ts = min(ts for ts, _ in self._token_log)
+                waits.append(oldest_ts + 60.0 - now)
             return max(waits) if waits else 0.0

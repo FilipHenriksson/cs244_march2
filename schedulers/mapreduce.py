@@ -101,7 +101,11 @@ class MapReduceScheduler:
             (coro_factory, est_tokens, future,
              agent_id, call_type, detail, position, group_id) = item
 
-            while not await self.limiter.try_acquire(est_tokens):
+            allowed, acquire_ts = False, None
+            while True:
+                allowed, acquire_ts = await self.limiter.try_acquire(est_tokens)
+                if allowed:
+                    break
                 wait = await self.limiter.wait_time()
                 wait = max(wait, 0.1)
                 pri = self._compute_priority(group_id)
@@ -121,9 +125,9 @@ class MapReduceScheduler:
             call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
                                     estimated_tokens=est_tokens)
-            asyncio.create_task(self._run(coro_factory, future, call, est_tokens))
+            asyncio.create_task(self._run(coro_factory, future, call, est_tokens, acquire_ts))
 
-    async def _run(self, coro_factory, future, call, est_tokens: int):
+    async def _run(self, coro_factory, future, call, est_tokens: int, acquire_ts: float | None):
         try:
             result = await coro_factory()
             if hasattr(result, "usage") and result.usage is not None:
@@ -131,6 +135,7 @@ class MapReduceScheduler:
                     result.usage.prompt_tokens,
                     result.usage.completion_tokens,
                     est_tokens,
+                    acquire_time=acquire_ts,
                 )
             trace.end_call(call)
             future.set_result(result)
