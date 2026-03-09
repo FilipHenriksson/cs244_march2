@@ -46,14 +46,16 @@ async def run_session(session_id: int, batch_id: int,
                              success=False, error=str(e))
 
 
-def compute_stagger_delays(n: int, stagger: float, mode: str) -> list[float]:
+def compute_stagger_delays(n: int, stagger: float, mode: str,
+                           rng: random.Random = None) -> list[float]:
     """Compute cumulative stagger delays for n sessions."""
     if mode == "fixed":
         return [i * stagger for i in range(n)]
     elif mode == "poisson":
+        r = rng or random
         delays = [0.0]
         for _ in range(n - 1):
-            inter_arrival = random.expovariate(1.0 / stagger)
+            inter_arrival = r.expovariate(1.0 / stagger)
             delays.append(delays[-1] + inter_arrival)
         return delays
     else:
@@ -61,23 +63,20 @@ def compute_stagger_delays(n: int, stagger: float, mode: str) -> list[float]:
 
 
 async def run_batch(batch_id: int, prompts: list[str],
-                    stagger_secs: float, stagger_mode: str,
-                    session_offset: int) -> list[SessionResult]:
-    """Launch all sessions in a batch with staggered starts."""
-    delays = compute_stagger_delays(len(prompts), stagger_secs, stagger_mode)
+                    stagger_delays: list[float]) -> list[SessionResult]:
+    """Launch all sessions in a batch with pre-computed stagger delays."""
     print(f"\n{'='*60}")
-    print(f" BATCH {batch_id}: launching {len(prompts)} sessions "
-          f"(stagger={stagger_secs}s, mode={stagger_mode})")
-    print(f" Arrival delays: {', '.join(f'{d:.1f}s' for d in delays)}")
+    print(f" BATCH {batch_id}: launching {len(prompts)} sessions")
+    print(f" Arrival delays: {', '.join(f'{d:.1f}s' for d in stagger_delays)}")
     print(f"{'='*60}")
 
     tasks = [
         asyncio.create_task(
             run_session(
-                session_id=session_offset + i,
+                session_id=batch_id * len(prompts) + i,
                 batch_id=batch_id,
                 prompt=p,
-                stagger_delay=delays[i],
+                stagger_delay=stagger_delays[i],
             )
         )
         for i, p in enumerate(prompts)
@@ -85,7 +84,20 @@ async def run_batch(batch_id: int, prompts: list[str],
     return list(await asyncio.gather(*tasks))
 
 
-async def run_one_scheduler(scheduler_name: str, args, limiter: RateLimiter):
+def generate_workload(batches: int, sessions: int, stagger: float,
+                      stagger_mode: str, seed: int) -> list[dict]:
+    """Pre-generate the full workload so every scheduler gets the same one."""
+    rng = random.Random(seed)
+    workload = []
+    for batch_id in range(batches):
+        prompts = [rng.choice(RESEARCH_PROMPTS) for _ in range(sessions)]
+        delays = compute_stagger_delays(sessions, stagger, stagger_mode, rng)
+        workload.append({"batch_id": batch_id, "prompts": prompts, "delays": delays})
+    return workload
+
+
+async def run_one_scheduler(scheduler_name: str, args, limiter: RateLimiter,
+                            workload: list[dict]):
     """Run all batches for a single scheduler. Returns (results, cost)."""
     print(f"\n{'#'*70}")
     print(f" SCHEDULER: {scheduler_name.upper()}")
@@ -105,23 +117,18 @@ async def run_one_scheduler(scheduler_name: str, args, limiter: RateLimiter):
     cost_exceeded = False
 
     try:
-        for batch_id in range(args.batches):
+        for batch in workload:
             if cost_exceeded:
-                print(f"\n[COST LIMIT] Skipping batch {batch_id} and beyond.")
+                print(f"\n[COST LIMIT] Skipping batch {batch['batch_id']} and beyond.")
                 break
 
-            prompts = [random.choice(RESEARCH_PROMPTS)
-                       for _ in range(args.sessions)]
-
             batch_results = await run_batch(
-                batch_id=batch_id,
-                prompts=prompts,
-                stagger_secs=args.stagger,
-                stagger_mode=args.stagger_mode,
-                session_offset=len(all_results),
+                batch_id=batch["batch_id"],
+                prompts=batch["prompts"],
+                stagger_delays=batch["delays"],
             )
             all_results.extend(batch_results)
-            print_batch_summary(batch_id, batch_results)
+            print_batch_summary(batch["batch_id"], batch_results)
 
             if any(r.error and "CostLimitExceeded" in r.error
                    for r in batch_results):
@@ -137,15 +144,15 @@ async def run_one_scheduler(scheduler_name: str, args, limiter: RateLimiter):
 
 async def main():
     parser = argparse.ArgumentParser(description="Batch research agent runner")
-    parser.add_argument("--batches", type=int, default=1,
-                        help="Number of sequential batches (default: 1)")
-    parser.add_argument("--sessions", type=int, default=15,
-                        help="Sessions per batch (default: 15)")
+    parser.add_argument("--batches", type=int, default=3,
+                        help="Number of sequential batches (default: 3)")
+    parser.add_argument("--sessions", type=int, default=5,
+                        help="Sessions per batch (default: 5)")
     parser.add_argument("--stagger", type=float, default=4.0,
                         help="Mean seconds between session starts (default: 4.0)")
-    parser.add_argument("--stagger-mode", type=str, default="poisson",
+    parser.add_argument("--stagger-mode", type=str, default="fixed",
                         choices=["fixed", "poisson"],
-                        help="Stagger mode: fixed or poisson (default: poisson)")
+                        help="Stagger mode: fixed or poisson (default: fixed)")
     parser.add_argument("--scheduler", type=str, default="fifo",
                         choices=ALL_SCHEDULERS)
     parser.add_argument("--all-schedulers", action="store_true",
@@ -154,24 +161,37 @@ async def main():
                         help="Rate limit: requests per minute (default: 30)")
     parser.add_argument("--tpm", type=int, default=200_000,
                         help="Rate limit: tokens per minute (default: 200000)")
-    parser.add_argument("--cost-limit", type=float, default=10.0,
-                        help="Hard cost cap in USD (default: 10.0)")
+    parser.add_argument("--cost-limit", type=float, default=20.0,
+                        help="Hard cost cap in USD (default: 20.0)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for workload generation (default: 42)")
     args = parser.parse_args()
 
     schedulers = ALL_SCHEDULERS if args.all_schedulers else [args.scheduler]
     limiter = RateLimiter(rpm=args.rpm, tpm=args.tpm)
+
+    # Pre-generate workload once — all schedulers get identical prompts & delays
+    workload = generate_workload(args.batches, args.sessions, args.stagger,
+                                 args.stagger_mode, args.seed)
 
     total_sessions = args.batches * args.sessions * len(schedulers)
     print(f"Batch runner: {len(schedulers)} scheduler(s) x {args.batches} batches "
           f"x {args.sessions} sessions = {total_sessions} total")
     print(f"Schedulers: {', '.join(schedulers)} | RPM: {args.rpm} | TPM: {args.tpm}")
     print(f"Stagger: {args.stagger}s ({args.stagger_mode}) | Cost limit: ${args.cost_limit:.2f}")
+    print(f"Seed: {args.seed}")
+
+    # Print workload for verification
+    print(f"\nWorkload (same for all schedulers):")
+    for batch in workload:
+        prompts_short = [p[:50] + "..." if len(p) > 50 else p for p in batch["prompts"]]
+        print(f"  Batch {batch['batch_id']}: {prompts_short}")
 
     results_by_scheduler: dict[str, list[SessionResult]] = {}
     cost_by_scheduler: dict[str, float] = {}
 
     for sched_name in schedulers:
-        results, cost = await run_one_scheduler(sched_name, args, limiter)
+        results, cost = await run_one_scheduler(sched_name, args, limiter, workload)
         results_by_scheduler[sched_name] = results
         cost_by_scheduler[sched_name] = cost
 

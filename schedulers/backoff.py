@@ -9,6 +9,7 @@ class BackoffScheduler:
 
     def __init__(self, limiter: RateLimiter):
         self.limiter = limiter
+        self._rng = random.Random()  # own RNG so global seed doesn't affect jitter
 
     def start(self):
         pass
@@ -39,7 +40,7 @@ class BackoffScheduler:
                 return result
 
             # Rate limited — backoff with jitter
-            jitter = random.uniform(0, backoff * 0.5)
+            jitter = self._rng.uniform(0, backoff * 0.5)
             wait = backoff + jitter
             retries += 1
             print(f"  [BACKOFF] {agent_id}:{call_type} rate limited, "
