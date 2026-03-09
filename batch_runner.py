@@ -58,6 +58,23 @@ def compute_arrival_times(n: int, stagger: float, mode: str,
             inter_arrival = r.expovariate(1.0 / stagger)
             times.append(times[-1] + inter_arrival)
         return times
+    elif mode == "wave":
+        r = rng or random
+        times = []
+        t = 0.0
+        remaining = n
+        while remaining > 0:
+            # Random burst size: 2-5 sessions
+            burst_size = min(r.randint(2, 5), remaining)
+            # Sessions within a burst arrive 1-2s apart
+            for j in range(burst_size):
+                times.append(t)
+                t += r.uniform(0.5, 2.0)
+            remaining -= burst_size
+            # Gap between bursts: 15-35s
+            if remaining > 0:
+                t += r.uniform(15.0, 35.0)
+        return times
     else:
         raise ValueError(f"Unknown stagger mode: {mode}")
 
@@ -122,8 +139,8 @@ async def main():
     parser.add_argument("--stagger", type=float, default=4.0,
                         help="Mean seconds between session arrivals (default: 4.0)")
     parser.add_argument("--stagger-mode", type=str, default="fixed",
-                        choices=["fixed", "poisson"],
-                        help="Arrival mode: fixed or poisson (default: fixed)")
+                        choices=["fixed", "poisson", "wave"],
+                        help="Arrival mode: fixed, poisson, or wave (default: fixed)")
     parser.add_argument("--scheduler", type=str, default="fifo",
                         choices=ALL_SCHEDULERS)
     parser.add_argument("--schedulers", type=str, nargs="+",
