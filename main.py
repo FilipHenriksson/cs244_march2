@@ -20,7 +20,7 @@ async def main():
     parser.add_argument("--random", action="store_true", help="Pick a random research prompt")
     parser.add_argument("--prompt", type=str, help="Custom research prompt")
     parser.add_argument("--scheduler", type=str, default="fifo",
-                        choices=["backoff", "fifo", "sjf", "mapreduce"],
+                        choices=["backoff", "fifo", "sjf", "mapreduce", "adaptive_sjf"],
                         help="Scheduling strategy (default: fifo)")
     parser.add_argument("--rpm", type=int, default=20,
                         help="Rate limit: requests per minute (default: 20)")
