@@ -44,11 +44,14 @@ async def llm_call(messages, agent_id: str, call_type: str,
         group_id=group_id,
     )
 
-    # Post-call: record real token usage
-    if ct.cost_tracker is not None and response.usage is not None:
-        await ct.cost_tracker.record(
-            response.usage.prompt_tokens,
-            response.usage.completion_tokens,
-        )
+    # Post-call: record real token usage and correct rate limiter
+    if response.usage is not None:
+        actual_total = response.usage.prompt_tokens + response.usage.completion_tokens
+        await _scheduler.limiter.report_actual(est_tokens, actual_total)
+        if ct.cost_tracker is not None:
+            await ct.cost_tracker.record(
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+            )
 
     return response

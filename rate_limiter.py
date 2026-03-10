@@ -40,6 +40,15 @@ class RateLimiter:
             self._token_log.append((now, estimated_tokens))
             return True
 
+    async def report_actual(self, estimated_tokens: int, actual_tokens: int):
+        """Adjust the token window after receiving real usage from the API."""
+        diff = actual_tokens - estimated_tokens
+        if diff == 0:
+            return
+        async with self._lock:
+            now = time.time()
+            self._token_log.append((now, diff))
+
     def reset(self):
         """Clear sliding window state for a fresh run."""
         self._request_times.clear()
