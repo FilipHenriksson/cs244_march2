@@ -129,7 +129,7 @@ async def run_one_scheduler(scheduler_name: str, args, limiter: RateLimiter,
 
     cost = ct.cost_tracker.total_cost if ct.cost_tracker else 0.0
     print_aggregate_summary(results, ct.cost_tracker)
-    trace.print_summary()
+    trace.print_summary(rl_stats=limiter.stats)
     return results, cost
 
 

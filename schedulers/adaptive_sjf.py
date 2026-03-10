@@ -1,6 +1,6 @@
 import asyncio
 import time
-from rate_limiter import RateLimiter
+from rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
 from trace import trace
 
 
@@ -79,9 +79,11 @@ class AdaptiveSJFScheduler:
         self._enqueue_counter += 1
         position = self._enqueue_counter
         tracking_key = self._tracking_key(call_type, detail)
+        enqueue_time = time.time()
         self._pending.append((
             coro_factory, estimated_tokens, future,
-            agent_id, call_type, detail, position, group_id, tracking_key
+            agent_id, call_type, detail, position, group_id,
+            tracking_key, enqueue_time
         ))
         self._notify.set()
         return await future
@@ -119,18 +121,25 @@ class AdaptiveSJFScheduler:
             item = self._pending[idx]
             (coro_factory, est_tokens, future,
              agent_id, call_type, detail, position,
-             group_id, tracking_key) = item
+             group_id, tracking_key, enqueue_time) = item
 
-            acquire_time = None
+            rpm_waits = 0
+            tpm_waits = 0
+            acquired = False
             while True:
-                acquire_time = await self.limiter.try_acquire(est_tokens)
-                if acquire_time is not None:
+                throttle = await self.limiter.try_acquire(est_tokens)
+                if throttle is None:
+                    acquired = True
                     break
+                if throttle == THROTTLE_RPM:
+                    rpm_waits += 1
+                else:
+                    tpm_waits += 1
                 wait = await self.limiter.wait_time(est_tokens)
                 wait = max(wait, 0.1)
                 pred = self._predicted_duration(tracking_key)
                 print(f"  [ASJF] queue waiting {wait:.2f}s for capacity "
-                      f"(next: {agent_id}:{call_type}, pred={pred:.2f}s)")
+                      f"(next: {agent_id}:{call_type}, pred={pred:.2f}s, reason={throttle})")
                 await asyncio.sleep(wait)
                 # Re-pick after waiting — EMA may have updated
                 new_idx = self._pick_best()
@@ -139,22 +148,26 @@ class AdaptiveSJFScheduler:
                 item = self._pending[new_idx]
                 (coro_factory, est_tokens, future,
                  agent_id, call_type, detail, position,
-                 group_id, tracking_key) = item
+                 group_id, tracking_key, enqueue_time) = item
                 idx = new_idx
 
-            if acquire_time is None:
+            if not acquired:
                 continue
 
             self._pending.pop(idx)
+            queue_wait = time.time() - enqueue_time
             call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
-                                    estimated_tokens=est_tokens)
+                                    queue_wait=queue_wait,
+                                    estimated_tokens=est_tokens,
+                                    rpm_waits=rpm_waits,
+                                    tpm_waits=tpm_waits)
             asyncio.create_task(
                 self._run(coro_factory, future, call, tracking_key,
-                          est_tokens, acquire_time))
+                          est_tokens))
 
     async def _run(self, coro_factory, future, call, tracking_key: str,
-                   est_tokens: int, acquire_time: float):
+                   est_tokens: int):
         try:
             t0 = time.time()
             result = await coro_factory()
@@ -163,13 +176,11 @@ class AdaptiveSJFScheduler:
                     result.usage.prompt_tokens,
                     result.usage.completion_tokens,
                     est_tokens,
-                    acquire_time,
                 )
             self._record_duration(tracking_key, time.time() - t0)
             trace.end_call(call)
             future.set_result(result)
         except Exception as e:
-            await self.limiter.record_actual_usage(
-                0, 0, est_tokens, acquire_time)
+            await self.limiter.record_actual_usage(0, 0, est_tokens)
             trace.end_call(call)
             future.set_exception(e)

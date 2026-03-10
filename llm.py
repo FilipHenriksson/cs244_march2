@@ -9,7 +9,7 @@ client = AsyncOpenAI()
 # Active scheduler — set by main.py before any calls
 _scheduler = None
 # Default max_tokens for output; set via set_max_tokens() from CLI
-_max_tokens = 4096
+_max_tokens = 1024
 
 
 def set_scheduler(scheduler):

@@ -1,5 +1,6 @@
 import asyncio
-from rate_limiter import RateLimiter
+import time
+from rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
 from trace import trace
 
 
@@ -36,25 +37,40 @@ class FIFOScheduler:
         future = asyncio.get_event_loop().create_future()
         self._enqueue_counter += 1
         position = self._enqueue_counter
+        enqueue_time = time.time()
         await self._queue.put((coro_factory, estimated_tokens, future,
-                               agent_id, call_type, detail, position))
+                               agent_id, call_type, detail, position,
+                               enqueue_time))
         return await future
 
     async def _drain(self):
         while True:
             item = await self._queue.get()
-            coro_factory, est_tokens, future, agent_id, call_type, detail, position = item
+            (coro_factory, est_tokens, future, agent_id, call_type,
+             detail, position, enqueue_time) = item
 
-            # Wait until rate limiter allows
-            while not await self.limiter.try_acquire(est_tokens):
+            rpm_waits = 0
+            tpm_waits = 0
+            while True:
+                throttle = await self.limiter.try_acquire(est_tokens)
+                if throttle is None:
+                    break
+                if throttle == THROTTLE_RPM:
+                    rpm_waits += 1
+                else:
+                    tpm_waits += 1
                 wait = await self.limiter.wait_time(est_tokens)
                 wait = max(wait, 0.1)
                 print(f"  [FIFO] queue waiting {wait:.2f}s for capacity "
-                      f"(next: {agent_id}:{call_type})")
+                      f"(next: {agent_id}:{call_type}, reason={throttle})")
                 await asyncio.sleep(wait)
 
+            queue_wait = time.time() - enqueue_time
             call = trace.start_call(agent_id, call_type, detail,
-                                    queue_position=position)
+                                    queue_position=position,
+                                    queue_wait=queue_wait,
+                                    rpm_waits=rpm_waits,
+                                    tpm_waits=tpm_waits)
             asyncio.create_task(
                 self._run(coro_factory, future, call, est_tokens))
 

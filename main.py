@@ -64,7 +64,7 @@ async def main():
 
     print(f"\n  Cost:")
     print(ct.cost_tracker.summary())
-    trace.print_summary()
+    trace.print_summary(rl_stats=limiter.stats)
 
 
 if __name__ == "__main__":

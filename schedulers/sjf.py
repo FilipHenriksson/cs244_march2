@@ -1,5 +1,6 @@
 import asyncio
-from rate_limiter import RateLimiter
+import time
+from rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
 from trace import trace
 
 
@@ -36,29 +37,43 @@ class SJFScheduler:
         future = asyncio.get_event_loop().create_future()
         self._enqueue_counter += 1
         position = self._enqueue_counter
-        # Priority: (estimated_tokens, insertion_order) for stable sorting
+        enqueue_time = time.time()
         priority = (estimated_tokens, self._enqueue_counter)
         await self._queue.put((priority, coro_factory, future,
-                               agent_id, call_type, detail, position))
+                               agent_id, call_type, detail, position,
+                               enqueue_time))
         return await future
 
     async def _drain(self):
         while True:
             item = await self._queue.get()
-            priority, coro_factory, future, agent_id, call_type, detail, position = item
+            (priority, coro_factory, future, agent_id, call_type,
+             detail, position, enqueue_time) = item
             est_tokens = priority[0]
 
-            # Wait until rate limiter allows
-            while not await self.limiter.try_acquire(est_tokens):
+            rpm_waits = 0
+            tpm_waits = 0
+            while True:
+                throttle = await self.limiter.try_acquire(est_tokens)
+                if throttle is None:
+                    break
+                if throttle == THROTTLE_RPM:
+                    rpm_waits += 1
+                else:
+                    tpm_waits += 1
                 wait = await self.limiter.wait_time(est_tokens)
                 wait = max(wait, 0.1)
                 print(f"  [SJF] queue waiting {wait:.2f}s for capacity "
-                      f"(next: {agent_id}:{call_type}, {est_tokens} tokens)")
+                      f"(next: {agent_id}:{call_type}, {est_tokens} tokens, reason={throttle})")
                 await asyncio.sleep(wait)
 
+            queue_wait = time.time() - enqueue_time
             call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
-                                    estimated_tokens=est_tokens)
+                                    queue_wait=queue_wait,
+                                    estimated_tokens=est_tokens,
+                                    rpm_waits=rpm_waits,
+                                    tpm_waits=tpm_waits)
             asyncio.create_task(
                 self._run(coro_factory, future, call, est_tokens))
 
