@@ -8,6 +8,7 @@ from schedulers.token_sjf import TokenSJFScheduler
 from schedulers.combined_map_reduce_adaptive_sjf import CombinedMapReduceAdaptiveSJFScheduler
 from schedulers.combined_map_reduce_token_sjf import CombinedMapReduceTokenSJFScheduler
 from schedulers.token_sjf_skip import TokenSJFSkipScheduler
+from schedulers.mapreduce_improved import MapReduceImprovedScheduler
 
 
 def get_scheduler(name: str, limiter: RateLimiter):
@@ -19,6 +20,8 @@ def get_scheduler(name: str, limiter: RateLimiter):
         return SJFScheduler(limiter)
     elif name == "mapreduce":
         return MapReduceScheduler(limiter)
+    elif name == "mapreduce_improved":
+        return MapReduceImprovedScheduler(limiter)
     elif name == "adaptive_sjf":
         return AdaptiveSJFScheduler(limiter)
     elif name == "token_sjf":
@@ -32,6 +35,6 @@ def get_scheduler(name: str, limiter: RateLimiter):
     else:
         raise ValueError(
             f"Unknown scheduler: {name}. Use: backoff, fifo, sjf, mapreduce, "
-            f"adaptive_sjf, token_sjf, token_sjf_skip, "
+            f"mapreduce_improved, adaptive_sjf, token_sjf, token_sjf_skip, "
             f"combined_mapreduce_asjf, combined_mapreduce_tsjf"
         )
