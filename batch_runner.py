@@ -1,3 +1,63 @@
+"""Batch experiment runner — compare scheduling policies under identical workloads.
+
+Experiment design
+-----------------
+This script is the primary entry point for generating research results.  It
+runs one or more scheduling policies back-to-back, each processing the *same*
+workload, then prints a side-by-side comparison of latency and cost metrics.
+
+Sessions and batching
+---------------------
+A **session** is one call to ``orchestrate()``, which drives the full five-stage
+research pipeline (breakdown → agents → synthesis → reviewers → finalize),
+producing ~15-25 LLM calls per session.  A **batch** is a group of sessions
+launched concurrently against a single shared rate limiter, simulating multiple
+users contending for the same API quota.
+
+Workload determinism
+--------------------
+Before any scheduler runs, ``generate_workload()`` pre-generates the full set
+of prompt assignments and arrival times from a fixed random seed.  Every
+scheduler therefore sees *exactly* the same session prompts arriving at the same
+relative times.  Between schedulers all mutable state (rate-limiter buckets,
+trace log, cost tracker) is reset so results are independent.
+
+Arrival modes
+-------------
+Sessions do not all start at t=0.  ``compute_arrival_times()`` supports three
+modes that control how sessions enter the system:
+  - **fixed**   — uniform spacing (deterministic)
+  - **poisson** — exponentially-distributed inter-arrivals (random, realistic)
+  - **wave**    — bursty clusters separated by longer gaps
+
+Execution pseudocode
+--------------------
+::
+
+  # 1. Generate one deterministic workload (--seed)
+  prompts[0..N], arrivals[0..N] = generate_workload(--sessions N, --stagger, --stagger-mode, --seed)
+
+  # 2. Run each scheduler against that same workload
+  for scheduler_name in selected_schedulers:        # --scheduler / --schedulers / --all-schedulers
+
+      reset(rate_limiter, trace, cost_tracker)       # fresh state per scheduler
+      scheduler = new Scheduler(scheduler_name, rate_limiter(--rpm, --tpm))
+
+      # 3. Launch all N sessions concurrently; each sleeps until its arrival time
+      async for i in 0..N-1:
+          sleep(arrivals[i])                         # staggered entry into the system
+          session_result[i] = orchestrate(prompts[i])
+              # orchestrate() issues ~15-25 LLM calls across 5 pipeline stages.
+              # Every llm_call() is routed through the shared scheduler, which
+              # queues, prioritizes (--scheduler), and rate-limits (--rpm/--tpm)
+              # each request before forwarding it to the OpenAI API.
+
+      collect results, cost
+
+  # 4. Compare scheduler metrics side-by-side (if >1 scheduler)
+  print_comparison(results_by_scheduler, cost_by_scheduler)
+"""
+
 import argparse
 import asyncio
 import logging
@@ -24,7 +84,7 @@ ALL_SCHEDULERS = ["backoff", "fifo", "sjf", "mapreduce", "mapreduce_improved",
 
 async def run_session(session_id: int, prompt: str,
                       stagger_delay: float) -> SessionResult:
-    """Run a single orchestrate() session with staggered start."""
+    """Run one orchestrate() session, sleeping *stagger_delay* seconds first."""
     await asyncio.sleep(stagger_delay)
     start = time.time()
     try:
@@ -51,7 +111,11 @@ async def run_session(session_id: int, prompt: str,
 
 def compute_arrival_times(n: int, stagger: float, mode: str,
                           rng: random.Random = None) -> list[float]:
-    """Compute cumulative arrival times for n sessions."""
+    """Return *n* cumulative arrival offsets (seconds from t=0).
+
+    *stagger* is the mean inter-arrival gap.  *mode* selects the distribution:
+    fixed (deterministic), poisson (memoryless), or wave (bursty clusters).
+    """
     if mode == "fixed":
         return [i * stagger for i in range(n)]
     elif mode == "poisson":
@@ -93,7 +157,13 @@ def generate_workload(sessions: int, stagger: float,
 
 async def run_one_scheduler(scheduler_name: str, args, limiter: RateLimiter,
                             workload: dict, num_schedulers: int):
-    """Run all sessions for a single scheduler with continuous arrivals."""
+    """Execute a full batch of sessions under one scheduler, returning results.
+
+    Resets all shared state (rate limiter, trace, cost tracker) so this
+    scheduler's run is independent of any prior one.  Sessions are launched
+    concurrently with pre-computed arrival delays; the scheduler and rate
+    limiter mediate their contention for the API.
+    """
     print(f"\n{'#'*70}")
     print(f" SCHEDULER: {scheduler_name.upper()}")
     print(f"{'#'*70}")
@@ -135,7 +205,21 @@ async def run_one_scheduler(scheduler_name: str, args, limiter: RateLimiter,
     return results, cost
 
 
-async def main():
+def _configure_logging():
+    """Suppress noisy HTTP/OpenAI logs; isolate rate-limiter logger."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    for name in ("openai", "httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    rl_log = logging.getLogger("rate_limiter")
+    rl_log.propagate = False
+    if not rl_log.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("%(message)s"))
+        rl_log.addHandler(h)
+        rl_log.setLevel(logging.INFO)
+
+
+def _parse_args():
     parser = argparse.ArgumentParser(description="Batch research agent runner")
     parser.add_argument("--sessions", type=int, default=15,
                         help="Total number of sessions (default: 15)")
@@ -161,19 +245,12 @@ async def main():
                         help="Max tokens per completion (default: 1024)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for workload generation (default: 42)")
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    for _name in ("openai", "httpx", "httpcore"):
-        logging.getLogger(_name).setLevel(logging.WARNING)
-    # Prevent duplicate rate limit logs from propagation
-    rl_log = logging.getLogger("rate_limiter")
-    rl_log.propagate = False
-    if not rl_log.handlers:
-        h = logging.StreamHandler()
-        h.setFormatter(logging.Formatter("%(message)s"))
-        rl_log.addHandler(h)
-        rl_log.setLevel(logging.INFO)
+
+async def main():
+    args = _parse_args()
+    _configure_logging()
 
     if args.all_schedulers:
         schedulers = ALL_SCHEDULERS
