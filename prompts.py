@@ -1,3 +1,5 @@
+"""Research topics used as workload inputs for single and batch runs."""
+
 RESEARCH_PROMPTS = [
     "What are the latest advances in quantum error correction?",
     "How does CRISPR-Cas9 compare to base editing for therapeutic use?",

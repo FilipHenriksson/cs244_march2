@@ -1,3 +1,13 @@
+"""Simulated tool implementations and their OpenAI function-calling schemas.
+
+Each tool is backed by an LLM call that simulates the tool's behavior (e.g.
+web_search generates realistic search snippets rather than hitting a real API).
+This keeps the workload representative of real agent systems while making
+experiments reproducible and cost-controlled.
+
+execute_tool() is the dispatch entry point called by the agent loop.
+"""
+
 import json
 from llm import llm_call
 

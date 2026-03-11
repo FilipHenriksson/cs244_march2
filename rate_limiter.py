@@ -67,7 +67,7 @@ class RateLimiter:
         elapsed = now - self._last_refill
         if elapsed > 0:
             self._rpm_bucket = min(self.rpm, self._rpm_bucket + elapsed * self._rpm_rate)
-            self._tpm_bucketg = min(self.tpm, self._tpm_bucket + elapsed * self._tpm_rate)
+            self._tpm_bucket = min(self.tpm, self._tpm_bucket + elapsed * self._tpm_rate)
             self._last_refill = now
 
     async def try_acquire(self, estimated_tokens: int) -> str | None:
