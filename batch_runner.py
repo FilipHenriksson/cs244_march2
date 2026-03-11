@@ -17,7 +17,8 @@ import cost_tracker as ct
 from cost_tracker import init_cost_tracker, CostLimitExceeded
 from metrics import (SessionResult, print_aggregate_summary, print_comparison)
 
-ALL_SCHEDULERS = ["backoff", "fifo", "sjf", "mapreduce", "adaptive_sjf"]
+ALL_SCHEDULERS = ["backoff", "fifo", "sjf", "mapreduce", "adaptive_sjf", "token_sjf",
+                  "token_sjf_skip", "combined_mapreduce_asjf", "combined_mapreduce_tsjf"]
 
 
 async def run_session(session_id: int, prompt: str,

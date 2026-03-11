@@ -79,6 +79,12 @@ class RateLimiter:
                          prompt_tokens, completion_tokens, actual,
                          estimated_tokens, delta, self._tpm_bucket)
 
+    async def available_capacity(self) -> tuple[bool, float]:
+        """Return (rpm_available, tpm_budget) after refilling buckets."""
+        async with self._lock:
+            self._refill(time.time())
+            return self._rpm_bucket >= 1.0, self._tpm_bucket
+
     async def wait_time(self, estimated_tokens: int = 0) -> float:
         """Return exact seconds until both buckets can satisfy the request."""
         async with self._lock:
