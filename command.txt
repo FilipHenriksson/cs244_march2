@@ -1,0 +1,1 @@
+python -m sim.runner --sessions 30 --all-schedulers --prompt-mode strict --stagger 4.0 --stagger-mode fixed --rpm 30 --tpm 200000 --cost-limit 40.0 --seed 42 --output-dir results/

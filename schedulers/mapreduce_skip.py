@@ -1,3 +1,18 @@
+"""MapReduce scheduler with TPM-aware skipping.
+
+Combines MapReduce group-completion priority (priority = 1 / active_in_session)
+with the skip logic from TokenSJFSkip: when the highest-priority item can't
+fit the current TPM budget, the scheduler searches for a lower-priority item
+that *does* fit, rather than blocking the entire queue.
+
+A bisect-sorted index on estimated tokens enables O(log n) identification of
+which pending items fit the available TPM budget.  Among those, the best
+MapReduce-priority item is dispatched.
+
+This avoids the head-of-line blocking problem where a large orchestrator call
+(with accumulated context) blocks smaller analyst calls from being dispatched.
+"""
+
 import asyncio
 import bisect
 import json
@@ -6,30 +21,12 @@ from sim.rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
 from sim.trace import trace
 
 
-class TokenSJFSkipScheduler:
-    """Token-SJF with TPM-aware skipping.
+class MapReduceSkipScheduler:
+    """MapReduce priority with TPM-aware skipping and learned token estimates.
 
-    Extends TokenSJFScheduler with a key improvement: when the top SJF-priority
-    item can't fit the current TPM window, the scheduler searches for a
-    lower-priority item that *does* fit, rather than busy-waiting.
-
-    A bisect-sorted index on estimated tokens enables O(log n) identification
-    of which pending items fit the available TPM budget.  Among those, the
-    best SJF-priority item (shortest predicted output) is dispatched.
-
-    Notification (_notify asyncio.Event):
-        The drain loop parks on _notify when idle (no items) or when waiting
-        for rate-limit capacity to refill (interruptible sleep).  Two
-        producers set the event:
-          - submit(): a new request was enqueued, so the drain loop should
-            re-evaluate whether something can be dispatched now.
-          - _record_output(): a completed request updated the EMA, which may
-            change SJF priorities or token estimates, so the drain loop
-            should wake and re-pick.
-        Interruptible sleeps (used for RPM/TPM waits) wrap _notify.wait()
-        in asyncio.wait_for with the sleep duration as timeout, so the loop
-        reacts immediately to new work instead of blocking for the full
-        refill interval.
+    Priority = 1 / (active calls for session).  When the top-priority item
+    can't fit the TPM budget, dispatches the highest-priority item that does.
+    Uses learned output-token EMA for tighter rate-limiter reservations.
     """
 
     BUFFER_RATIO = 0.2
@@ -48,6 +45,9 @@ class TokenSJFSkipScheduler:
         self._next_id: int = 0
         self._enqueue_counter: int = 0
 
+        # Session tracking (MapReduce priority)
+        self._session_active: dict[str, int] = {}
+
         # Learned output-token tracking
         self._ema: dict[str, float] = {}
         self._counts: dict[str, int] = {}
@@ -56,7 +56,38 @@ class TokenSJFSkipScheduler:
         # Skip stats
         self._tpm_skips: int = 0
 
-    # --- Output-token learning ------------------------------------------------
+    # --- Backward-compatible no-ops ---
+
+    def register_group(self, group_id: str, size: int):
+        pass
+
+    def deregister_member(self, group_id: str):
+        pass
+
+    # --- Session key extraction ---
+
+    @staticmethod
+    def _session_key(agent_id: str) -> str | None:
+        if ":" in agent_id:
+            return agent_id.split(":")[0]
+        return None
+
+    # --- Session tracking ---
+
+    def _track_submit(self, session: str | None):
+        if session is not None:
+            self._session_active[session] = self._session_active.get(session, 0) + 1
+
+    def _track_complete(self, session: str | None):
+        if session is not None:
+            count = self._session_active.get(session, 1) - 1
+            if count <= 0:
+                self._session_active.pop(session, None)
+            else:
+                self._session_active[session] = count
+            self._notify.set()
+
+    # --- Output-token learning ---
 
     @staticmethod
     def _tracking_key(call_type: str, detail: str) -> str:
@@ -77,7 +108,7 @@ class TokenSJFSkipScheduler:
             self._counts[key] += 1
         self._notify.set()
 
-    # --- Token estimation (called by llm.py) ----------------------------------
+    # --- Token estimation (called by llm.py) ---
 
     def estimate_total_tokens(self, messages, call_type: str,
                               detail: str = "", **kwargs) -> int:
@@ -93,7 +124,16 @@ class TokenSJFSkipScheduler:
         buffer = max(int(pred * self.BUFFER_RATIO), self.MIN_BUFFER)
         return input_tokens + int(pred) + buffer
 
-    # --- Item management (dict + bisect-sorted index) -------------------------
+    # --- MapReduce priority ---
+
+    def _compute_priority(self, session: str | None) -> float:
+        """Higher value = higher priority. Range (0, 1]."""
+        if session is None:
+            return 1.0
+        active = self._session_active.get(session, 1)
+        return 1.0 / max(active, 1)
+
+    # --- Item management (dict + bisect-sorted index) ---
 
     def _add_item(self, item: tuple) -> int:
         item_id = self._next_id
@@ -110,27 +150,28 @@ class TokenSJFSkipScheduler:
             self._sorted_tokens.pop(idx)
         return item
 
-    # --- Priority helpers -----------------------------------------------------
+    # --- Priority helpers ---
 
-    def _sjf_key(self, item_id: int) -> tuple[float, int]:
-        """Return (predicted_output, enqueue_order) for SJF comparison."""
+    def _mr_key(self, item_id: int) -> tuple[float, int]:
+        """Return (-priority, enqueue_order) for MapReduce comparison.
+        Lower tuple = better (highest priority, earliest arrival)."""
         item = self._items[item_id]
-        pred = self._predicted_output(item[8])  # tracking_key
-        val = pred if pred is not None else 0.0
-        return (val, item[6])  # (predicted, position)
+        session = item[7]  # session key
+        pri = self._compute_priority(session)
+        return (-pri, item[6])  # (negative priority, position)
 
-    def _pick_best_sjf(self) -> int | None:
-        """Best SJF-priority item across all pending items."""
+    def _pick_best_mr(self) -> int | None:
+        """Best MapReduce-priority item across all pending items."""
         if not self._items:
             return None
-        return min(self._items, key=self._sjf_key)
+        return min(self._items, key=self._mr_key)
 
     def _pick_best_fitting(self, budget: float) -> int | None:
-        """Best SJF-priority item whose est_tokens <= budget.
+        """Best MapReduce-priority item whose est_tokens <= budget.
 
         Uses bisect on the sorted token index to narrow candidates to
-        O(k) where k = number of items that fit, then picks best SJF
-        among those.
+        O(k) where k = number of items that fit, then picks best MR
+        priority among those.
         """
         cutoff = bisect.bisect_right(
             self._sorted_tokens, (int(budget), float('inf'))
@@ -142,13 +183,13 @@ class TokenSJFSkipScheduler:
         best_key = (float('inf'), float('inf'))
         for i in range(cutoff):
             _, item_id = self._sorted_tokens[i]
-            key = self._sjf_key(item_id)
+            key = self._mr_key(item_id)
             if key < best_key:
                 best_id = item_id
                 best_key = key
         return best_id
 
-    # --- Scheduler interface --------------------------------------------------
+    # --- Scheduler interface ---
 
     def start(self):
         self._drain_task = asyncio.create_task(self._drain())
@@ -161,12 +202,6 @@ class TokenSJFSkipScheduler:
             except asyncio.CancelledError:
                 pass
 
-    def register_group(self, group_id: str, size: int):
-        pass
-
-    def deregister_member(self, group_id: str):
-        pass
-
     async def submit(self, coro_factory, estimated_tokens: int,
                      agent_id: str, call_type: str, detail: str = "",
                      group_id: str = None):
@@ -175,16 +210,18 @@ class TokenSJFSkipScheduler:
         position = self._enqueue_counter
         tracking_key = self._tracking_key(call_type, detail)
         enqueue_time = time.time()
+        session = self._session_key(agent_id)
+        self._track_submit(session)
         item = (
             coro_factory, estimated_tokens, future,
-            agent_id, call_type, detail, position, group_id,
+            agent_id, call_type, detail, position, session,
             tracking_key, enqueue_time
         )
         self._add_item(item)
         self._notify.set()
         return await future
 
-    # --- Internal drain loop --------------------------------------------------
+    # --- Internal drain loop ---
 
     async def _interruptible_sleep(self, seconds: float):
         """Sleep up to *seconds*, waking early if _notify fires."""
@@ -202,22 +239,21 @@ class TokenSJFSkipScheduler:
 
             rpm_ok, tpm_budget = await self.limiter.available_capacity()
 
-            # ---- RPM blocked: nothing can be dispatched --------------------
+            # ---- RPM blocked: nothing can be dispatched ----
             if not rpm_ok:
                 wait = await self.limiter.wait_time(0)
                 wait = max(wait, 0.1)
-                sjf_id = self._pick_best_sjf()
-                if sjf_id is not None:
-                    item = self._items[sjf_id]
-                    pred = self._predicted_output(item[8])
-                    pred_str = f"{pred:.0f}tok" if pred is not None else "unseen"
-                    print(f"  [TSJFs] rpm wait {wait:.2f}s "
-                          f"(next: {item[3]}:{item[4]}, pred={pred_str})")
+                mr_id = self._pick_best_mr()
+                if mr_id is not None:
+                    item = self._items[mr_id]
+                    pri = self._compute_priority(item[7])
+                    print(f"  [MR-S] rpm wait {wait:.2f}s "
+                          f"(next: {item[3]}:{item[4]}, pri={pri:.2f})")
                 await self._interruptible_sleep(wait)
                 continue
 
-            # ---- Find best item that fits current TPM window ---------------
-            sjf_id = self._pick_best_sjf()
+            # ---- Find best item that fits current TPM window ----
+            mr_id = self._pick_best_mr()
             fit_id = self._pick_best_fitting(tpm_budget)
 
             if fit_id is None:
@@ -226,14 +262,14 @@ class TokenSJFSkipScheduler:
                               if self._sorted_tokens else 0)
                 wait = await self.limiter.wait_time(min_tokens)
                 wait = max(wait, 0.1)
-                print(f"  [TSJFs] tpm wait {wait:.2f}s, nothing fits "
+                print(f"  [MR-S] tpm wait {wait:.2f}s, nothing fits "
                       f"(budget={tpm_budget:.0f}tok, "
                       f"cheapest={min_tokens}tok, "
                       f"pending={len(self._items)})")
                 await self._interruptible_sleep(wait)
                 continue
 
-            skipped = (fit_id != sjf_id)
+            skipped = (fit_id != mr_id)
             if skipped:
                 self._tpm_skips += 1
 
@@ -246,18 +282,18 @@ class TokenSJFSkipScheduler:
                 await asyncio.sleep(0.05)
                 continue
 
-            # ---- Dispatch ------------------------------------------------
+            # ---- Dispatch ----
             item = self._remove_item(fit_id)
             (coro_factory, est_tokens, future,
              agent_id, call_type, detail, position,
-             group_id, tracking_key, enqueue_time) = item
+             session, tracking_key, enqueue_time) = item
 
-            if skipped and sjf_id in self._items:
-                sjf_item = self._items[sjf_id]
-                print(f"  [TSJFs] skip: dispatching {agent_id}:{call_type} "
+            if skipped and mr_id in self._items:
+                mr_item = self._items[mr_id]
+                print(f"  [MR-S] skip: dispatching {agent_id}:{call_type} "
                       f"({est_tokens}tok) ahead of "
-                      f"{sjf_item[3]}:{sjf_item[4]} "
-                      f"({sjf_item[1]}tok) "
+                      f"{mr_item[3]}:{mr_item[4]} "
+                      f"({mr_item[1]}tok) "
                       f"[budget={tpm_budget:.0f}tok, "
                       f"total_skips={self._tpm_skips}]")
 
@@ -270,10 +306,10 @@ class TokenSJFSkipScheduler:
                                     tpm_waits=0)
             asyncio.create_task(
                 self._run(coro_factory, future, call, tracking_key,
-                          est_tokens))
+                          est_tokens, session))
 
     async def _run(self, coro_factory, future, call, tracking_key: str,
-                   est_tokens: int):
+                   est_tokens: int, session: str | None):
         try:
             result = await coro_factory()
             if hasattr(result, "usage") and result.usage is not None:
@@ -291,3 +327,5 @@ class TokenSJFSkipScheduler:
             await self.limiter.record_actual_usage(0, 0, est_tokens)
             trace.end_call(call)
             future.set_exception(e)
+        finally:
+            self._track_complete(session)

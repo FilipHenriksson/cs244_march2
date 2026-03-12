@@ -1,7 +1,7 @@
 import asyncio
 import time
-from rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
-from trace import trace
+from sim.rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
+from sim.trace import trace
 
 
 class AdaptiveSJFScheduler:
@@ -30,11 +30,12 @@ class AdaptiveSJFScheduler:
     def _tracking_key(call_type: str, detail: str) -> str:
         """Compute the key for duration tracking.
 
-        agent_turn varies significantly by round, so we include the detail.
+        Orchestrator calls vary significantly by round (round-0 is small,
+        round-1 carries all analyst results), so we include the detail.
         All other call types are tracked by bare name.
         """
-        if call_type == "agent_turn":
-            return f"agent_turn:{detail}"
+        if call_type == "orchestrator":
+            return f"orchestrator:{detail}"
         return call_type
 
     def _predicted_duration(self, key: str) -> float:

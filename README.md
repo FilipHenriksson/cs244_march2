@@ -1,164 +1,156 @@
 # CS244 - LLM Agent Scheduling Strategies
 
-A multi-agent research system that studies how different scheduling strategies affect performance when multiple LLM-powered agents compete for rate-limited API access.
+A research system that studies how different scheduling strategies affect performance when multiple LLM-powered agent sessions compete for rate-limited API access.
 
 ## Overview
 
-The system simulates a realistic multi-tenant LLM workload: multiple research sessions arrive over time, each spawning parallel agents that compete for a shared, rate-limited API. A pluggable scheduler sits between agents and the API, controlling dispatch order. By running the same workload through different schedulers, we can empirically compare their effect on latency, throughput, and fairness.
+The system simulates a realistic multi-tenant LLM workload: multiple research sessions arrive over time, each spawning a tool-calling agent that fans out parallel LLM calls competing for a shared, rate-limited API. A pluggable scheduler sits between tools and the API, controlling dispatch order. By running the same workload through different schedulers, we can empirically compare their effect on latency, throughput, and fairness.
 
 **Model**: OpenAI `gpt-4.1-nano`
 
-## Simulation Pipeline
+## Agent Architecture
 
-Each research session follows a fan-out/fan-in pattern:
-
-```
-orchestrate(topic)
-  1. Breakdown     — LLM splits topic into 5 sub-questions
-  2. Fan-out       — 5 agents research in parallel (asyncio.gather)
-  3. Synthesis     — LLM combines all agent findings
-  4. Review        — 3 reviewers run in parallel (citations, style, facts)
-  5. Finalization  — LLM integrates reviewer feedback into polished output
-```
-
-### Agent Behavior
-
-Each agent runs a tool-use loop (up to 3 rounds):
+Each research session runs a deterministic **strict pipeline** with exactly 11 LLM calls:
 
 ```
-1. Send messages + tool schemas to LLM
-2. If LLM returns tool calls → execute tools, append results, go to 1
-3. If LLM returns text → return as final answer
+run_agent(prompt)
+  Step 1:  Orchestrator plans the research                    (1 LLM call)
+  Step 2:  5 analysts run in parallel (fan-out)               (5 LLM calls)
+  Step 3:  Orchestrator drafts synthesis from findings         (1 LLM call)
+  Step 4:  3 reviewers run in parallel (fan-out)              (3 LLM calls)
+  Step 5:  Orchestrator produces final synthesis               (1 LLM call)
 ```
 
-Available tools (all simulated via LLM):
-- **web_search(query)** — returns 3–5 search result snippets
-- **summarize(text)** — distills text into key points
-- **analyze(text, question)** — answers a specific question about text
+Steps 3 and 5 are **barrier points** — they cannot start until the entire preceding fan-out completes. A single slow analyst in step 2 blocks the entire session from reaching step 3. This fan-out/fan-in structure is the key bottleneck that schedulers must optimize.
+
+### Tools
+
+Each tool is a single LLM call with a specialized system prompt. Tools are designed with **deliberately varied output lengths** so that different tools produce meaningfully different response sizes — this creates heterogeneous workloads that exercise scheduler prioritization.
+
+**9 Analysts** (each takes a `question` parameter), ordered by expected output length:
+- `analyst_statistical` — short numbered list of data points only
+- `analyst_summarizer` — brief 5-7 bullet executive summary (<200 words)
+- `analyst_counterarguments` — focused 3-5 counterarguments
+- `analyst_web_research` — moderate structured research briefing
+- `analyst_comparative` — detailed multi-approach comparison with table
+- `analyst_trend_forecast` — multi-horizon forward-looking analysis
+- `analyst_deep_analysis` — exhaustive mechanism/causal examination
+- `analyst_historical_context` — comprehensive historical timeline
+- `analyst_expert_synthesis` — long-form technical review
+
+**3 Reviewers** (each takes a `text` parameter), ordered by expected output length:
+- `review_style` — quick pass, only flags significant issues
+- `review_citations` — thorough check of every factual claim's sourcing
+- `review_facts` — rigorous evaluation of every claim with verdicts and confidence
 
 ### Batch Runner
 
-`batch_runner.py` orchestrates multi-scheduler comparison runs:
+`python -m sim.runner` orchestrates multi-scheduler comparison runs:
 
-1. **Workload generation** — pre-generates a balanced set of prompts (equal copies of each research topic, shuffled) and arrival times. The same workload is reused for every scheduler.
+1. **Workload generation** — pre-generates a balanced set of prompts and arrival times from a fixed seed. The same workload is reused for every scheduler.
 2. **Arrival modes** — sessions arrive according to one of three patterns:
    - `fixed` — uniform spacing (e.g., every 4s)
    - `poisson` — exponentially distributed inter-arrivals
-   - `wave` — bursts of 2–5 sessions with 15–35s gaps between bursts
+   - `wave` — bursts of 2-5 sessions with 15-35s gaps between bursts
 3. **Per-scheduler run** — resets rate limiter and trace, launches all sessions with staggered arrivals, collects results.
-4. **Fairness controls** — scheduler order is shuffled (seeded) to avoid time-of-day bias; 30s cooldown between runs.
-5. **Comparison** — prints side-by-side table of metrics across all schedulers.
+4. **Comparison** — prints side-by-side table of metrics across all schedulers.
 
 ## Rate Limiter
 
-`rate_limiter.py` enforces OpenAI-style sliding-window rate limits:
+`sim/rate_limiter.py` enforces dual token-bucket rate limits:
 
-- **RPM (requests per minute)** — tracks request timestamps in a 60-second rolling window
-- **TPM (tokens per minute)** — tracks `(timestamp, token_count)` tuples in a 60-second rolling window
+- **RPM (requests per minute)** — bucket refills at `rpm/60` per second
+- **TPM (tokens per minute)** — bucket refills at `tpm/60` per second
 
 Key behavior:
-- `try_acquire(estimated_tokens)` — returns True if both RPM and TPM allow the request; logs estimated tokens
-- `report_actual(estimated, actual)` — called after each API response to correct the token window with real usage from `response.usage`
-- `wait_time()` — estimates seconds until the oldest entry expires from the window
-- Token estimates use `len(json.dumps(messages)) // 4` as a rough heuristic, then get corrected post-call
+- `try_acquire(estimated_tokens)` — returns `None` if capacity available, or throttle reason
+- `record_actual_usage(prompt, completion, estimated)` — reconciles actual vs estimated tokens
+- `wait_time(estimated_tokens)` — seconds until capacity is available
+- `available_capacity()` — snapshot of current RPM/TPM bucket levels (used by skip-based schedulers)
 
 ## Cost Tracking
 
-`cost_tracker.py` enforces a hard budget per scheduler run:
+`sim/cost_tracker.py` enforces a hard budget per scheduler run:
 
 - Input: $0.10 / 1M tokens, Output: $0.40 / 1M tokens
 - Pre-flight `check()` before each LLM call raises `CostLimitExceeded` if over budget
 - Post-call `record()` updates totals with actual usage
 - Total budget is divided equally across schedulers in a comparison run
-- If any scheduler hits the limit, the batch runner prints a loud warning and flags results as invalid
 
 ## Schedulers
 
-All six schedulers implement the same interface:
+All 4 active schedulers implement the same interface:
 
 ```python
 def start()                                    # start background drain task
 async def stop()                               # graceful shutdown
 async def submit(coro_factory, est_tokens,     # submit an LLM call
                  agent_id, call_type, detail,
-                 group_id=None) → response
+                 group_id=None) -> response
 def register_group(group_id, size)             # declare a fan-out group
 def deregister_member(group_id)                # one group member completed
 ```
 
 ### 1. Backoff
 
-**Strategy**: Decentralized — no shared queue.
-
-Each agent calls the API directly. On rate limit rejection, retries with exponential backoff (`1s → 2s → 4s → ... → 30s` cap) plus random jitter. Agents don't coordinate, which leads to wasted retries under contention.
+**Strategy**: Decentralized — no shared queue. Each call retries independently with exponential backoff (1s -> 2s -> 4s -> ... -> 30s cap) plus random jitter on rate limit rejection. Agents don't coordinate.
 
 ### 2. FIFO
 
-**Strategy**: Global first-in-first-out queue with a single drain task.
+**Strategy**: Global first-in-first-out queue with a single drain task. Fair and predictable, but large calls can cause head-of-line blocking — the entire queue stalls when the front item can't fit the TPM budget.
 
-All calls are enqueued in arrival order. The drain task processes them sequentially, waiting for rate limiter capacity before dispatching. Fair and predictable, but large calls can cause head-of-line blocking.
+### 3. MapReduce
 
-### 3. SJF (Shortest Job First)
+**Strategy**: Group-completion-aware priority. Priority = `1 / active_calls_in_session`. As fan-out members complete, remaining members' priority increases (e.g., last analyst gets priority 1.0 vs 1/5 when all 5 were active). Groups are inferred automatically from session prefixes in agent_id. Accelerates fan-in barrier completion.
 
-**Strategy**: Priority queue ordered by estimated token count (ascending).
+### 4. MapReduce Skip
 
-Like FIFO but dispatches smaller jobs first. Uses `asyncio.PriorityQueue` with `(estimated_tokens, insertion_order)` as the key. Optimizes throughput for short requests but may starve large ones under heavy load. Priority is static — set at enqueue time and never updated.
+**Strategy**: Combines MapReduce group-completion priority with TPM-aware skipping. When the highest-priority item can't fit the current TPM budget, dispatches the highest-priority item that *does* fit, using a bisect-sorted index for O(log n) lookup. Also uses learned output-token EMA for tighter rate-limiter reservations instead of worst-case `max_tokens`. Interruptible sleeps wake on new submissions for faster response.
 
-### 4. MapReduce
+## Exploration & Learning
 
-**Strategy**: Dynamic group-aware priority.
+During development we built, tested, and ultimately deprecated 6 additional schedulers. The results below are from a 30-session run (RPM=30, TPM=200k, seed=42, max_tokens=1024, strict mode with uniform analyst prompts):
 
-Tracks fan-out groups registered by the orchestrator. Priority is computed as `1 / active_members_in_group`:
+| Rank | Scheduler | Mean (s) | Median (s) | P95 (s) | Stdev (s) | RPM Throttles | Parallelism | Max Queue Wait (s) |
+|------|-----------|----------|------------|---------|-----------|---------------|-------------|-------------------|
+| 1 | MapReduce | 280.9 | 279.9 | 489.9 | 140.8 | 284 | 4.15 | 470.5 |
+| 2 | MapReduce Improved | 285.5 | 284.8 | 484.0 | 141.2 | 285 | 4.88 | 469.6 |
+| 3 | Combined MR + Token SJF | 318.0 | 316.3 | 503.7 | 134.2 | 284 | 4.10 | 460.3 |
+| 4 | Combined MR + Adaptive SJF | 330.6 | 346.6 | 498.8 | 133.7 | 277 | 5.52 | 465.8 |
+| 5 | Token SJF Skip | 380.6 | 408.6 | 502.0 | 129.0 | 0 | 5.35 | 452.1 |
+| 6 | Backoff | 402.6 | 442.5 | 558.9 | 124.6 | 1207 | 4.76 | 0.0 |
+| 7 | FIFO | 420.9 | 494.9 | 515.6 | 142.8 | 293 | 5.04 | 162.0 |
+| 8 | Adaptive SJF | 429.0 | 494.6 | 512.9 | 141.5 | 287 | 4.10 | 288.0 |
+| 9 | Token SJF | 479.7 | 497.3 | 505.6 | 84.9 | 290 | 3.78 | 462.4 |
+| 10 | SJF | 522.1 | 518.5 | 597.1 | 45.8 | 291 | 4.06 | 567.4 |
 
-- Group of 5 agents → each starts at priority 0.2
-- As members complete → remaining members' priority increases
-- Last member gets priority 1.0 (same as singletons)
-- Singleton calls (synthesis, finalization) always get priority 1.0
+### Deprecated Schedulers and Why They Underperformed
 
-Re-picks the best job during rate limit waits, since group membership can change while sleeping. This accelerates fan-in phases — the last agent to finish gets boosted to prevent it from blocking synthesis.
+**SJF (Shortest Job First)** — `schedulers/deprecated/sjf_deprecated.py`
+Static priority queue ordered by estimated input token count. Dispatches the smallest request first. Suffered from **starvation**: orchestrator calls grow in token size as they accumulate analyst/reviewer results, so they are perpetually deprioritized behind every small analyst call from every session. Max queue wait of 567s confirms large calls waited nearly the entire run. The low stdev (45.8s) means all sessions were equally slow — none could complete because their orchestrator calls were starved. Worst performer overall.
 
-### 5. Adaptive SJF
+**Token SJF** — `schedulers/deprecated/token_sjf_deprecated.py`
+SJF with learned output-token EMA for priority and tighter rate-limiter reservations. Improved on static SJF by learning actual output sizes, but still suffered from **head-of-line blocking**: when the top-priority item couldn't fit the TPM budget, the entire queue blocked waiting for capacity. Parallelism dropped to 3.78 (lowest of all schedulers) because no work could proceed while waiting. No group awareness meant fan-out stragglers got no boost.
 
-**Strategy**: SJF with learned duration prediction via EMA.
+**Token SJF Skip** — `schedulers/deprecated/token_sjf_skip_deprecated.py`
+Extended Token SJF with TPM-aware skipping — when the top item can't fit the TPM budget, dispatches a smaller item that does fit. This eliminated head-of-line blocking (0 RPM throttles, 5.35 parallelism). However, it still lacked group awareness, so a session's last analyst got no priority boost over fresh analysts from other sessions. The skip mechanism alone improved throughput but couldn't optimize for session completion time.
 
-Instead of using static token estimates, learns actual wall-clock completion times per call type using an exponential moving average (α = 0.3). Prioritizes calls with the shortest predicted duration.
+**Adaptive SJF** — `schedulers/deprecated/` (in `combined_mapreduce_tsjf_deprecated.py` as a component)
+SJF with learned wall-clock duration EMA instead of token counts. Duration-based prediction is inherently noisier than token-based (includes network latency, server queuing, variable overhead), and in this workload all calls within the same phase have similar durations. The EMA converges quickly, so all analysts get similar predicted durations, making it effectively FIFO-with-extra-steps among same-type calls. No group awareness.
 
-Key design choices:
-- `agent_turn` calls are tracked per-round (`agent_turn:round-0`, `agent_turn:round-1`, etc.) since durations vary significantly by round
-- **Unseen call types get priority 0.0** (highest) — exploration over exploitation
-- Re-picks during rate limit waits as EMA updates from concurrent completions
+**Combined MapReduce + Token SJF** — `schedulers/deprecated/combined_mapreduce_tsjf_deprecated.py`
+Score = `predicted_output_tokens x active_members_in_group` (lower = better). Aimed to combine the best of both: group-completion priority and short-job-first ordering. But the token estimation component **diluted the group-completion signal** — a short-output call in a large group could be prioritized over a straggler that was the last in its group. With the initial uniform analyst prompts (all producing similar-length outputs), the token prediction added noise without value. The `token_overestimate_ratio` of 1.30 indicates the learned estimates were imperfect.
 
-### 6. Combined (MapReduce + Adaptive SJF)
+**Combined MapReduce + Adaptive SJF** — `schedulers/deprecated/combined_mapreduce_tsjf_deprecated.py`
+Score = `predicted_duration x active_members_in_group`. Same idea as the token variant but using wall-clock duration EMA. Performed worse because duration predictions are noisier and less correlated with the actual resource consumed (tokens) by the rate limiter — the scheduler optimized a proxy that didn't align with the constraint.
 
-**Strategy**: Merges group-aware priority with learned durations.
+**MapReduce Improved vs MapReduce (original)** — Both survived but were consolidated. The original MapReduce used explicit `register_group`/`deregister_member` calls. MapReduce Improved inferred groups from session prefixes in agent_id. In the strict pipeline where phases are sequential within a session, these produce identical behavior — the ~5s difference (1.6%) was noise. We kept the improved version (auto-inference) for its simpler API and renamed it to just "MapReduce".
 
-Priority score: `predicted_duration × active_members_in_group` (lower = better)
+### Key Insight
 
-- Short jobs in nearly-complete groups get top priority
-- Singletons (reduce-phase calls): `pred × 1`, no penalty
-- Unseen call types: `0.0 × anything = 0.0`, exploration-first preserved
-- As group members complete, remaining members' scores decrease (priority rises)
+The dominant factor in this workload is **fan-out/fan-in barrier completion**: a session cannot progress until its last fan-out member finishes. Schedulers that directly prioritize group stragglers (MapReduce) outperform those that optimize individual call metrics (SJF variants). The skip mechanism from Token SJF Skip is valuable for avoiding head-of-line blocking but is orthogonal to group awareness — combining both (MapReduce Skip) should capture the benefits of each.
 
-Combines the fan-in acceleration of MapReduce with the workload-adaptive scheduling of Adaptive SJF.
-
-## Results
-
-15 sessions, seed=42, stagger=4s fixed, rpm=30, tpm=200k:
-
-```
-Metric       |    mapreduce |     combined | adaptive_sjf |      backoff |         fifo |          sjf
-----------------------------------------------------------------------------------------------------------
-mean         |      645.64s |      661.86s |      698.61s |      715.74s |      719.52s |      725.64s
-median       |      708.15s |      712.96s |      747.09s |      752.08s |      734.64s |      714.20s
-p95          |      762.20s |      756.18s |      791.82s |      821.17s |      793.45s |      793.22s
-stdev        |      162.54s |      125.53s |      137.26s |       94.69s |       70.98s |       38.43s
-cost         |      $0.0869 |      $0.0864 |      $0.0854 |      $0.0853 |      $0.0843 |      $0.0869
-```
-
-- **mapreduce** has the lowest mean latency but highest variance
-- **combined** has the best p95 and lower variance than both parent schedulers
-- **sjf** is the most consistent (lowest stdev) but slowest on average
-- Cost is nearly identical across all schedulers (~$0.085)
+The initial experiments used **uniform analyst prompts** that produced similar-length outputs, which limited the benefit of SJF-style prioritization. The current version uses deliberately varied prompts (short bullet lists vs. exhaustive analyses) to create heterogeneous workloads that better exercise priority-based scheduling.
 
 ## Setup
 
@@ -181,56 +173,68 @@ pip install -r requirements.txt
 ### Single session
 
 ```bash
+python main.py
 python main.py --prompt "quantum error correction" --scheduler fifo --rpm 20
+python main.py --random --scheduler mapreduce
 ```
 
 ### Batch comparison
 
 ```bash
-# Run all 6 schedulers and compare
-python batch_runner.py --all-schedulers --sessions 15 --seed 42
+# Run all 4 schedulers and compare
+python -m sim.runner --all-schedulers --sessions 15 --seed 42
 
 # Run specific schedulers
-python batch_runner.py --schedulers fifo mapreduce combined --sessions 15
+python -m sim.runner --schedulers fifo mapreduce mapreduce_skip --sessions 10
 
-# Single scheduler
-python batch_runner.py --scheduler combined --sessions 15
+# Single scheduler with poisson arrivals
+python -m sim.runner --scheduler fifo --sessions 15 --stagger-mode poisson
+
+# Save results to timestamped directory
+python -m sim.runner --all-schedulers --sessions 30 --output-dir results/
 ```
 
-### CLI options (batch_runner.py)
+### CLI options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--scheduler` | `fifo` | Single scheduler to run |
-| `--schedulers` | — | List of schedulers to compare |
-| `--all-schedulers` | — | Run all 6 schedulers |
+| `--schedulers` | -- | List of schedulers to compare |
+| `--all-schedulers` | -- | Run all 4 schedulers |
 | `--sessions` | `15` | Number of research sessions |
 | `--stagger` | `4.0` | Mean seconds between arrivals |
 | `--stagger-mode` | `fixed` | `fixed`, `poisson`, or `wave` |
 | `--rpm` | `30` | Requests per minute limit |
 | `--tpm` | `200000` | Tokens per minute limit |
-| `--cost-limit` | `50.0` | Total cost cap in USD (split across schedulers) |
+| `--cost-limit` | `20.0` | Total cost cap in USD (split across schedulers) |
+| `--max-tokens` | `2048` | Max tokens per completion |
 | `--seed` | `42` | RNG seed for reproducibility |
+| `--prompt-mode` | `strict` | `default` (LLM picks tools) or `strict` (fixed pipeline) |
+| `--output-dir` | -- | Directory for output files (auto-creates timestamped subdir) |
 
 ## Architecture
 
 ```
 main.py                      Single-session entry point
-batch_runner.py              Multi-scheduler benchmark runner
-orchestrator.py              Breakdown → fan-out → synthesis → review → finalize
-agent.py                     Tool-use agent loop (up to 3 rounds)
+agent.py                     Research agent — strict pipeline (11 LLM calls)
 llm.py                       LLM call dispatcher (routes through scheduler)
+tools/
+  analysts.py                9 analyst tools (varied output lengths)
+  reviewers.py               3 reviewer tools (varied output lengths)
+prompts/
+  system.py                  Orchestrator agent system prompt
+  topics.py                  Research topic list (5 topics)
 schedulers/
-  backoff.py                 Exponential backoff strategy
-  fifo.py                    FIFO queue strategy
-  sjf.py                     Shortest-job-first strategy
-  mapreduce.py               Group-aware dynamic priority
-  adaptive_sjf.py            SJF with learned duration prediction
-  combined.py                MapReduce + Adaptive SJF hybrid
-tools.py                     Tool schemas and execution (simulated via LLM)
-rate_limiter.py              RPM/TPM sliding window enforcement
-cost_tracker.py              Budget tracking and kill switch
-trace.py                     Call logging and timeline visualization
-metrics.py                   Session duration statistics and comparison tables
-prompts.py                   Research topic list (5 topics)
+  backoff.py                 Exponential backoff (no queue)
+  fifo.py                    FIFO queue
+  mapreduce.py               Group-aware dynamic priority (auto-inferred sessions)
+  mapreduce_skip.py          MapReduce + TPM-aware skipping + learned tokens
+  deprecated/                Explored and deprecated schedulers (see above)
+sim/
+  runner.py                  Batch experiment runner (python -m sim.runner)
+  workload.py                Workload generation (arrivals + prompt assignment)
+  rate_limiter.py            Token-bucket rate limiter (RPM + TPM)
+  cost_tracker.py            Budget tracking and kill switch
+  trace.py                   Call logging and timeline visualization
+  metrics.py                 Session statistics and comparison tables
 ```

@@ -89,14 +89,14 @@ class Trace:
             llm_t = sum(c.duration for c in ac)
             retries = sum(c.retries for c in ac)
             extra = f", {retries} retries" if retries else ""
-            print(f"   {a:<16} {len(ac)} calls, {llm_t:.2f}s LLM{extra}")
+            print(f"   {a:<28} {len(ac)} calls, {llm_t:.2f}s LLM{extra}")
 
         # Calls per type
         types = sorted(set(c.call_type for c in self.calls))
         print(f"\n Per call type:")
         for t in types:
             tc = [c for c in self.calls if c.call_type == t]
-            print(f"   {t:<16} {len(tc)} calls, {sum(c.duration for c in tc):.2f}s total")
+            print(f"   {t:<28} {len(tc)} calls, {sum(c.duration for c in tc):.2f}s total")
 
         # Retry stats (backoff scheduler)
         total_retries = sum(c.retries for c in self.calls)
@@ -124,7 +124,7 @@ class Trace:
                     for t in types_waited:
                         tw = [c for c in waited_calls if c.call_type == t]
                         total_t = sum(c.queue_wait for c in tw)
-                        print(f"     {t:<18} {len(tw)} waited, "
+                        print(f"     {t:<28} {len(tw)} waited, "
                               f"{total_t:.2f}s total, max {max(c.queue_wait for c in tw):.2f}s")
                 total_rpm = sum(c.rpm_waits for c in self.calls)
                 total_tpm = sum(c.tpm_waits for c in self.calls)
@@ -171,6 +171,20 @@ class Trace:
 
         print(f"        {'0':}<{width}>{total:.1f}s")
         print(f"{'='*70}\n")
+
+    def get_stats(self) -> dict:
+        """Return computed metrics as a dict for comparison tables."""
+        total_wall = time.time() - self.t0
+        total_llm = sum(c.duration for c in self.calls)
+        waited = [c for c in self.calls if c.queue_wait > 0.01]
+        return {
+            "wall_time": total_wall,
+            "total_llm_calls": len(self.calls),
+            "total_llm_time": total_llm,
+            "parallelism": total_llm / total_wall if total_wall > 0 else 0,
+            "mean_queue_wait": (sum(c.queue_wait for c in waited) / len(waited)) if waited else 0,
+            "max_queue_wait": max((c.queue_wait for c in waited), default=0),
+        }
 
     def reset(self):
         """Clear all call history for a fresh run."""

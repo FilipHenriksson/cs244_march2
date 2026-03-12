@@ -7,7 +7,7 @@ directly.  llm_call() handles:
   - Routing through the active scheduler (backoff, FIFO, SJF, MapReduce, etc.)
   - Post-call cost recording
 
-The active scheduler is set once at startup by main.py / batch_runner.py via
+The active scheduler is set once at startup by main.py / sim/runner.py via
 set_scheduler().  Group lifecycle helpers (register_group / deregister_member)
 are forwarded to the scheduler so that callers don't need direct access to the
 scheduler instance.
@@ -16,14 +16,13 @@ scheduler instance.
 import json
 import os
 from openai import AsyncOpenAI
-import cost_tracker as ct
-from cost_tracker import CostLimitExceeded
+import sim.cost_tracker as ct
 
 MODEL = "gpt-4.1-nano"
 client = AsyncOpenAI()
 
 _scheduler = None          # set once at startup via set_scheduler()
-_max_tokens = 1024         # default output cap; overridable via set_max_tokens()
+_max_tokens = 2048         # default output cap; overridable via set_max_tokens()
 
 
 def set_scheduler(scheduler):
