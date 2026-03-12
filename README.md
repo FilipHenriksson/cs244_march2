@@ -48,10 +48,9 @@ Each tool is a single LLM call with a specialized system prompt. Tools are desig
 `python -m sim.runner` orchestrates multi-scheduler comparison runs:
 
 1. **Workload generation** — pre-generates a balanced set of prompts and arrival times from a fixed seed. The same workload is reused for every scheduler.
-2. **Arrival modes** — sessions arrive according to one of three patterns:
-   - `fixed` — uniform spacing (e.g., every 4s)
-   - `poisson` — exponentially distributed inter-arrivals
-   - `wave` — bursts of 2-5 sessions with 15-35s gaps between bursts
+2. **Simulation types** — sessions arrive according to one of two patterns:
+   - `constant` — uniform spacing (e.g., every 4s), simulating steady predictable load
+   - `bursty` — bursts of 2-5 sessions with 15-35s gaps between bursts, simulating traffic spikes
 3. **Per-scheduler run** — resets rate limiter and trace, launches all sessions with staggered arrivals, collects results.
 4. **Comparison** — prints side-by-side table of metrics across all schedulers.
 
@@ -79,7 +78,7 @@ Key behavior:
 
 ## Schedulers
 
-All 4 active schedulers implement the same interface:
+All 5 active schedulers implement the same interface:
 
 ```python
 def start()                                    # start background drain task
@@ -106,6 +105,10 @@ def deregister_member(group_id)                # one group member completed
 ### 4. MapReduce Skip
 
 **Strategy**: Combines MapReduce group-completion priority with TPM-aware skipping. When the highest-priority item can't fit the current TPM budget, dispatches the highest-priority item that *does* fit, using a bisect-sorted index for O(log n) lookup. Also uses learned output-token EMA for tighter rate-limiter reservations instead of worst-case `max_tokens`. Interruptible sleeps wake on new submissions for faster response.
+
+### 5. MapReduce Skip Adaptive
+
+**Strategy**: Extends MapReduce Skip with output-aware secondary priority. When multiple calls share the same MapReduce straggler priority (e.g., five analysts from one session, all at priority 1/5), the call with the lowest predicted output-token count is dispatched first. Shorter calls complete sooner, freeing rate-limiter capacity faster and reducing mean session time. Priority key: `(-mapreduce_priority, predicted_output_tokens, enqueue_order)`.
 
 ## Exploration & Learning
 
@@ -181,14 +184,14 @@ python main.py --random --scheduler mapreduce
 ### Batch comparison
 
 ```bash
-# Run all 4 schedulers and compare
+# Run all 5 schedulers and compare
 python -m sim.runner --all-schedulers --sessions 15 --seed 42
 
 # Run specific schedulers
 python -m sim.runner --schedulers fifo mapreduce mapreduce_skip --sessions 10
 
-# Single scheduler with poisson arrivals
-python -m sim.runner --scheduler fifo --sessions 15 --stagger-mode poisson
+# Single scheduler with bursty arrivals
+python -m sim.runner --scheduler fifo --sessions 15 --stagger-mode bursty
 
 # Save results to timestamped directory
 python -m sim.runner --all-schedulers --sessions 30 --output-dir results/
@@ -203,7 +206,7 @@ python -m sim.runner --all-schedulers --sessions 30 --output-dir results/
 | `--all-schedulers` | -- | Run all 4 schedulers |
 | `--sessions` | `15` | Number of research sessions |
 | `--stagger` | `4.0` | Mean seconds between arrivals |
-| `--stagger-mode` | `fixed` | `fixed`, `poisson`, or `wave` |
+| `--stagger-mode` | `constant` | `constant` (uniform arrivals) or `bursty` (wave clusters) |
 | `--rpm` | `30` | Requests per minute limit |
 | `--tpm` | `200000` | Tokens per minute limit |
 | `--cost-limit` | `20.0` | Total cost cap in USD (split across schedulers) |
@@ -229,6 +232,7 @@ schedulers/
   fifo.py                    FIFO queue
   mapreduce.py               Group-aware dynamic priority (auto-inferred sessions)
   mapreduce_skip.py          MapReduce + TPM-aware skipping + learned tokens
+  mapreduce_skip_adaptive.py MapReduce Skip + output-aware secondary priority
   deprecated/                Explored and deprecated schedulers (see above)
 sim/
   runner.py                  Batch experiment runner (python -m sim.runner)

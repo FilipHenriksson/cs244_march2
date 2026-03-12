@@ -3,6 +3,7 @@ from schedulers.backoff import BackoffScheduler
 from schedulers.fifo import FIFOScheduler
 from schedulers.mapreduce import MapReduceScheduler
 from schedulers.mapreduce_skip import MapReduceSkipScheduler
+from schedulers.mapreduce_skip_adaptive import MapReduceSkipAdaptiveScheduler
 
 
 def get_scheduler(name: str, limiter: RateLimiter):
@@ -14,7 +15,10 @@ def get_scheduler(name: str, limiter: RateLimiter):
         return MapReduceScheduler(limiter)
     elif name == "mapreduce_skip":
         return MapReduceSkipScheduler(limiter)
+    elif name == "mapreduce_skip_adaptive":
+        return MapReduceSkipAdaptiveScheduler(limiter)
     else:
         raise ValueError(
-            f"Unknown scheduler: {name}. Use: backoff, fifo, mapreduce, mapreduce_skip"
+            f"Unknown scheduler: {name}. Use: backoff, fifo, mapreduce, "
+            f"mapreduce_skip, mapreduce_skip_adaptive"
         )

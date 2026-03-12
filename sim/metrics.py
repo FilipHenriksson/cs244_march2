@@ -114,6 +114,31 @@ def print_comparison(results_by_scheduler: dict[str, list["SessionResult"]],
         f"{rl_stats_by_scheduler.get(s, {}).get('tpm_throttles', 0)}"
         for s in schedulers
     ])
+    _row("RPM waits", [
+        f"{rl_stats_by_scheduler.get(s, {}).get('rpm_waits', 0)}"
+        for s in schedulers
+    ])
+    _row("TPM waits", [
+        f"{rl_stats_by_scheduler.get(s, {}).get('tpm_waits', 0)}"
+        for s in schedulers
+    ])
+    _row("TPM skips", [
+        f"{rl_stats_by_scheduler.get(s, {}).get('tpm_skips', 0)}"
+        for s in schedulers
+    ])
+
+    # Bottleneck indicator
+    def _bottleneck(s):
+        rl = rl_stats_by_scheduler.get(s, {})
+        rpm = rl.get("rpm_throttles", 0) + rl.get("rpm_waits", 0)
+        tpm = rl.get("tpm_throttles", 0) + rl.get("tpm_waits", 0)
+        if rpm == 0 and tpm == 0:
+            return "neither"
+        if rpm >= tpm:
+            return f"RPM ({rpm}v{tpm})"
+        return f"TPM ({tpm}v{rpm})"
+
+    _row("Bottleneck", [_bottleneck(s) for s in schedulers])
 
     # Token overestimation
     _row("Token overest.", [

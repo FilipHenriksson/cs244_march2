@@ -1,16 +1,16 @@
-"""MapReduce scheduler with TPM-aware skipping.
+"""MapReduce Skip Adaptive — adds output-aware secondary priority.
 
-Combines MapReduce group-completion priority (priority = 1 / active_in_session)
-with the skip logic from TokenSJFSkip: when the highest-priority item can't
-fit the current TPM budget, the scheduler searches for a lower-priority item
-that *does* fit, rather than blocking the entire queue.
+Extends MapReduce Skip with a secondary sort on predicted output tokens:
+when multiple pending calls share the same MapReduce straggler priority
+(e.g. five analysts from the same session, all at priority 1/5), the call
+with the lowest predicted output-token count is dispatched first.
 
-A bisect-sorted index on estimated tokens enables O(log n) identification of
-which pending items fit the available TPM budget.  Among those, the best
-MapReduce-priority item is dispatched.
+Shorter calls complete sooner, freeing rate-limiter capacity faster and
+reducing mean session completion time without sacrificing straggler
+prioritization.
 
-This avoids the head-of-line blocking problem where a large orchestrator call
-(with accumulated context) blocks smaller analyst calls from being dispatched.
+Priority key (lower tuple = better):
+    (-mapreduce_priority, predicted_output_tokens, enqueue_order)
 """
 
 import asyncio
@@ -21,12 +21,14 @@ from sim.rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
 from sim.trace import trace
 
 
-class MapReduceSkipScheduler:
-    """MapReduce priority with TPM-aware skipping and learned token estimates.
+class MapReduceSkipAdaptiveScheduler:
+    """MapReduce priority + output-token tiebreaking + TPM-aware skipping.
 
-    Priority = 1 / (active calls for session).  When the top-priority item
-    can't fit the TPM budget, dispatches the highest-priority item that does.
-    Uses learned output-token EMA for tighter rate-limiter reservations.
+    Priority = 1 / (active calls for session).  Among equal-priority calls,
+    the one with the lowest predicted output tokens is dispatched first.
+    When the top-priority item can't fit the TPM budget, dispatches the
+    highest-priority item that does.  Uses learned output-token EMA for
+    tighter rate-limiter reservations.
     """
 
     BUFFER_RATIO = 0.2
@@ -35,9 +37,7 @@ class MapReduceSkipScheduler:
     def __init__(self, limiter: RateLimiter):
         self.limiter = limiter
 
-        # Primary store: item_id -> item tuple
         self._items: dict[int, tuple] = {}
-        # Sorted index for TPM budget queries: list of (est_tokens, item_id)
         self._sorted_tokens: list[tuple[int, int]] = []
 
         self._notify: asyncio.Event = asyncio.Event()
@@ -45,18 +45,16 @@ class MapReduceSkipScheduler:
         self._next_id: int = 0
         self._enqueue_counter: int = 0
 
-        # Session tracking (MapReduce priority)
         self._session_active: dict[str, int] = {}
 
-        # Learned output-token tracking
         self._ema: dict[str, float] = {}
         self._counts: dict[str, int] = {}
         self._alpha = 0.3
 
-        # Drain-loop stats (try_acquire doesn't capture these for skip schedulers)
         self._tpm_skips: int = 0
         self._rpm_waits: int = 0
         self._tpm_waits: int = 0
+        self._default_max_tokens = 1024
 
     # --- Backward-compatible no-ops ---
 
@@ -122,7 +120,7 @@ class MapReduceSkipScheduler:
         key = self._tracking_key(call_type, detail)
         pred = self._predicted_output(key)
         if pred is None:
-            return input_tokens + kwargs.get("max_tokens", 1024)
+            return input_tokens + kwargs.get("max_tokens", self._default_max_tokens)
         buffer = max(int(pred * self.BUFFER_RATIO), self.MIN_BUFFER)
         return input_tokens + int(pred) + buffer
 
@@ -154,26 +152,32 @@ class MapReduceSkipScheduler:
 
     # --- Priority helpers ---
 
-    def _mr_key(self, item_id: int) -> tuple[float, int]:
-        """Return (-priority, enqueue_order) for MapReduce comparison.
-        Lower tuple = better (highest priority, earliest arrival)."""
+    def _mr_key(self, item_id: int) -> tuple[float, float, int]:
+        """Return (-priority, predicted_output, enqueue_order).
+        Lower tuple = better: highest MR priority, then shortest predicted
+        output, then earliest arrival."""
         item = self._items[item_id]
-        session = item[7]  # session key
+        session = item[7]
+        tracking_key = item[8]
         pri = self._compute_priority(session)
-        return (-pri, item[6])  # (negative priority, position)
+        pred = self._predicted_output(tracking_key)
+        if pred is None:
+            pred_tokens = float(self._default_max_tokens)
+        else:
+            pred_tokens = pred
+        return (-pri, pred_tokens, item[6])
 
     def _pick_best_mr(self) -> int | None:
-        """Best MapReduce-priority item across all pending items."""
+        """Best priority item across all pending items."""
         if not self._items:
             return None
         return min(self._items, key=self._mr_key)
 
     def _pick_best_fitting(self, budget: float) -> int | None:
-        """Best MapReduce-priority item whose est_tokens <= budget.
+        """Best priority item whose est_tokens <= budget.
 
-        Uses bisect on the sorted token index to narrow candidates to
-        O(k) where k = number of items that fit, then picks best MR
-        priority among those.
+        Uses bisect on the sorted token index to narrow candidates, then
+        picks best (MR priority, predicted output, FIFO) among those.
         """
         cutoff = bisect.bisect_right(
             self._sorted_tokens, (int(budget), float('inf'))
@@ -182,7 +186,7 @@ class MapReduceSkipScheduler:
             return None
 
         best_id = None
-        best_key = (float('inf'), float('inf'))
+        best_key = (float('inf'), float('inf'), float('inf'))
         for i in range(cutoff):
             _, item_id = self._sorted_tokens[i]
             key = self._mr_key(item_id)
@@ -241,7 +245,6 @@ class MapReduceSkipScheduler:
 
             rpm_ok, tpm_budget = await self.limiter.available_capacity()
 
-            # ---- RPM blocked: nothing can be dispatched ----
             if not rpm_ok:
                 self._rpm_waits += 1
                 wait = await self.limiter.wait_time(0)
@@ -250,12 +253,11 @@ class MapReduceSkipScheduler:
                 if mr_id is not None:
                     item = self._items[mr_id]
                     pri = self._compute_priority(item[7])
-                    print(f"  [MR-S] rpm wait {wait:.2f}s "
+                    print(f"  [MR-SA] rpm wait {wait:.2f}s "
                           f"(next: {item[3]}:{item[4]}, pri={pri:.2f})")
                 await self._interruptible_sleep(wait)
                 continue
 
-            # ---- Find best item that fits current TPM window ----
             mr_id = self._pick_best_mr()
             fit_id = self._pick_best_fitting(tpm_budget)
 
@@ -265,7 +267,7 @@ class MapReduceSkipScheduler:
                               if self._sorted_tokens else 0)
                 wait = await self.limiter.wait_time(min_tokens)
                 wait = max(wait, 0.1)
-                print(f"  [MR-S] tpm wait {wait:.2f}s, nothing fits "
+                print(f"  [MR-SA] tpm wait {wait:.2f}s, nothing fits "
                       f"(budget={tpm_budget:.0f}tok, "
                       f"cheapest={min_tokens}tok, "
                       f"pending={len(self._items)})")
@@ -279,13 +281,11 @@ class MapReduceSkipScheduler:
             item = self._items[fit_id]
             est_tokens = item[1]
 
-            # Authoritative acquire (budget may have shifted slightly)
             throttle = await self.limiter.try_acquire(est_tokens)
             if throttle is not None:
                 await asyncio.sleep(0.05)
                 continue
 
-            # ---- Dispatch ----
             item = self._remove_item(fit_id)
             (coro_factory, est_tokens, future,
              agent_id, call_type, detail, position,
@@ -293,7 +293,7 @@ class MapReduceSkipScheduler:
 
             if skipped and mr_id in self._items:
                 mr_item = self._items[mr_id]
-                print(f"  [MR-S] skip: dispatching {agent_id}:{call_type} "
+                print(f"  [MR-SA] skip: dispatching {agent_id}:{call_type} "
                       f"({est_tokens}tok) ahead of "
                       f"{mr_item[3]}:{mr_item[4]} "
                       f"({mr_item[1]}tok) "

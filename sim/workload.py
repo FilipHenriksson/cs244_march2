@@ -13,18 +13,19 @@ def compute_arrival_times(n: int, stagger: float, mode: str,
     """Return *n* cumulative arrival offsets (seconds from t=0).
 
     *stagger* is the mean inter-arrival gap.  *mode* selects the distribution:
-    fixed (deterministic), poisson (memoryless), or wave (bursty clusters).
+
+    ``constant``
+        Uniform spacing — sessions arrive every *stagger* seconds, producing
+        a steady, predictable load.
+
+    ``bursty``
+        Wave-like clusters — bursts of 2-5 sessions arrive close together
+        (0.5-2s apart), separated by quiet gaps (15-35s).  Simulates
+        real-world traffic spikes.
     """
-    if mode == "fixed":
+    if mode == "constant":
         return [i * stagger for i in range(n)]
-    elif mode == "poisson":
-        r = rng or random
-        times = [0.0]
-        for _ in range(n - 1):
-            inter_arrival = r.expovariate(1.0 / stagger)
-            times.append(times[-1] + inter_arrival)
-        return times
-    elif mode == "wave":
+    elif mode == "bursty":
         r = rng or random
         times = []
         t = 0.0
@@ -39,7 +40,7 @@ def compute_arrival_times(n: int, stagger: float, mode: str,
                 t += r.uniform(15.0, 35.0)
         return times
     else:
-        raise ValueError(f"Unknown stagger mode: {mode}")
+        raise ValueError(f"Unknown sim type: {mode}")
 
 
 def generate_workload(sessions: int, stagger: float,

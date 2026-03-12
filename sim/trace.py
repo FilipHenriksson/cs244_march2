@@ -139,6 +139,20 @@ class Trace:
             print(f"   Successful acquires: {rl_stats['total_acquires']}")
             print(f"   RPM throttles:       {rl_stats['rpm_throttles']}")
             print(f"   TPM throttles:       {rl_stats['tpm_throttles']}")
+            rpm_waits = rl_stats.get('rpm_waits', 0)
+            tpm_waits = rl_stats.get('tpm_waits', 0)
+            tpm_skips = rl_stats.get('tpm_skips', 0)
+            if rpm_waits or tpm_waits or tpm_skips:
+                print(f"   RPM waits (sched):   {rpm_waits}")
+                print(f"   TPM waits (sched):   {tpm_waits}")
+                print(f"   TPM skips:           {tpm_skips}")
+            rpm_total = rl_stats['rpm_throttles'] + rpm_waits
+            tpm_total = rl_stats['tpm_throttles'] + tpm_waits
+            if rpm_total > 0 or tpm_total > 0:
+                if rpm_total >= tpm_total:
+                    print(f"   >> Bottleneck: RPM ({rpm_total} vs {tpm_total} TPM)")
+                else:
+                    print(f"   >> Bottleneck: TPM ({tpm_total} vs {rpm_total} RPM)")
             if rl_stats['total_actual'] > 0:
                 print(f"   Token estimation:")
                 print(f"     Total estimated:   {rl_stats['total_estimated']:,}")

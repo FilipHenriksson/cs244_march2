@@ -19,11 +19,12 @@ cs244_march2/
 │   └── topics.py           # Research topic prompts (workload inputs)
 │
 ├── schedulers/             # Pluggable scheduling policies
-│   ├── __init__.py         # get_scheduler() factory (4 active schedulers)
+│   ├── __init__.py         # get_scheduler() factory (5 active schedulers)
 │   ├── backoff.py          # Exponential backoff (no queue)
 │   ├── fifo.py             # Global FIFO queue
 │   ├── mapreduce.py        # Group-aware dynamic priority (auto-inferred sessions)
 │   ├── mapreduce_skip.py   # MapReduce + TPM-aware skipping + learned tokens
+│   ├── mapreduce_skip_adaptive.py  # MapReduce Skip + output-aware secondary priority
 │   └── deprecated/         # Explored and deprecated schedulers
 │       ├── sjf_deprecated.py
 │       ├── token_sjf_deprecated.py
@@ -108,7 +109,7 @@ Default max_tokens: 2048 (large enough to avoid truncation for long analysts).
 
 ### Schedulers
 
-All 4 active schedulers implement the same interface:
+All 5 active schedulers implement the same interface:
 
 ```python
 class Scheduler:
@@ -124,12 +125,13 @@ so group-aware schedulers can boost priority for the last calls in a group.
 
 **Active schedulers:**
 
-| Scheduler | Queue | Group-Aware | Token Learning | Skip |
-|-----------|-------|-------------|----------------|------|
-| Backoff | No (inline retry) | No | No | N/A |
-| FIFO | FIFO | No | No | No |
-| MapReduce | Priority (MR) | Yes | No | No |
-| MapReduce Skip | Priority (MR) | Yes | Yes (EMA) | Yes |
+| Scheduler | Queue | Group-Aware | Token Learning | Skip | Output Priority |
+|-----------|-------|-------------|----------------|------|-----------------|
+| Backoff | No (inline retry) | No | No | N/A | No |
+| FIFO | FIFO | No | No | No | No |
+| MapReduce | Priority (MR) | Yes | No | No | No |
+| MapReduce Skip | Priority (MR) | Yes | Yes (EMA) | Yes | No |
+| MapReduce Skip Adaptive | Priority (MR) | Yes | Yes (EMA) | Yes | Yes |
 
 ### Simulation
 
@@ -138,7 +140,7 @@ The `sim/` package provides infrastructure for running experiments:
 - **`runner.py`** — batch entry point (`python -m sim.runner`). Runs N sessions
   across one or more schedulers with identical workloads, then compares results.
 - **`workload.py`** — deterministic prompt assignment and arrival time generation
-  (fixed, poisson, or wave modes).
+  (constant or bursty simulation types).
 - **`rate_limiter.py`** — token-bucket enforcing RPM and TPM limits. Provides
   both `try_acquire`/`wait_time` (used by blocking schedulers) and
   `available_capacity` (used by skip-based schedulers for budget queries).
@@ -159,5 +161,5 @@ Batch comparison:
 ```bash
 python -m sim.runner --sessions 15 --scheduler fifo
 python -m sim.runner --sessions 30 --all-schedulers --output-dir results/
-python -m sim.runner --schedulers mapreduce mapreduce_skip --sessions 20 --stagger-mode poisson
+python -m sim.runner --schedulers mapreduce mapreduce_skip --sessions 20 --stagger-mode bursty
 ```

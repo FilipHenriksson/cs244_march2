@@ -6,7 +6,7 @@ workload, then prints a side-by-side comparison of latency and cost metrics.
 Usage::
 
     python -m sim.runner --sessions 15 --scheduler fifo
-    python -m sim.runner --sessions 10 --all-schedulers --stagger-mode poisson
+    python -m sim.runner --sessions 10 --all-schedulers --stagger-mode bursty
     python -m sim.runner --sessions 15 --all-schedulers --output-dir results/
 """
 
@@ -34,7 +34,7 @@ from schedulers import get_scheduler
 from llm import set_scheduler, set_max_tokens
 
 ALL_SCHEDULERS = [
-    "backoff", "fifo", "mapreduce", "mapreduce_skip",
+    "backoff", "fifo", "mapreduce", "mapreduce_skip", "mapreduce_skip_adaptive",
 ]
 
 
@@ -106,11 +106,13 @@ async def run_one_scheduler(scheduler_name: str, args, limiter: RateLimiter,
         ]
         results = list(await asyncio.gather(*tasks))
     finally:
+        sched_stats = scheduler.stats if hasattr(scheduler, 'stats') else {}
         await scheduler.stop()
 
     cost = ct.cost_tracker.total_cost if ct.cost_tracker else 0.0
     trace_stats = trace.get_stats()
     rl_stats = limiter.stats
+    rl_stats.update(sched_stats)
     failed_cost = [r for r in results
                    if not r.success and "Cost limit" in (r.error or "")]
     was_incomplete = len(failed_cost) > 0
@@ -179,6 +181,7 @@ def _write_comparison_csv(path, results_by_scheduler, cost_by_scheduler,
             "p95_session_s", "p99_session_s", "min_session_s", "max_session_s",
             "stdev_session_s", "cost_usd",
             "rpm_throttles", "tpm_throttles", "token_overestimate_ratio",
+            "rpm_waits", "tpm_waits", "tpm_skips", "bottleneck",
             "parallelism", "mean_queue_wait_s", "max_queue_wait_s",
         ])
         for sched in results_by_scheduler:
@@ -203,6 +206,15 @@ def _write_comparison_csv(path, results_by_scheduler, cost_by_scheduler,
             est = rl.get("total_estimated", 0)
             act = rl.get("total_actual", 1)
 
+            rpm_pressure = rl.get("rpm_throttles", 0) + rl.get("rpm_waits", 0)
+            tpm_pressure = rl.get("tpm_throttles", 0) + rl.get("tpm_waits", 0)
+            if rpm_pressure == 0 and tpm_pressure == 0:
+                bottleneck = "neither"
+            elif rpm_pressure >= tpm_pressure:
+                bottleneck = "RPM"
+            else:
+                bottleneck = "TPM"
+
             w.writerow([
                 sched, len(ok), len(results),
                 sum(r.llm_calls for r in ok),
@@ -218,6 +230,10 @@ def _write_comparison_csv(path, results_by_scheduler, cost_by_scheduler,
                 rl.get("rpm_throttles", 0),
                 rl.get("tpm_throttles", 0),
                 f"{est / max(1, act):.2f}",
+                rl.get("rpm_waits", 0),
+                rl.get("tpm_waits", 0),
+                rl.get("tpm_skips", 0),
+                bottleneck,
                 f"{ts.get('parallelism', 0):.2f}",
                 f"{ts.get('mean_queue_wait', 0):.2f}",
                 f"{ts.get('max_queue_wait', 0):.2f}",
@@ -267,9 +283,9 @@ def _parse_args():
                         help="Total number of sessions (default: 15)")
     parser.add_argument("--stagger", type=float, default=4.0,
                         help="Mean seconds between session arrivals (default: 4.0)")
-    parser.add_argument("--stagger-mode", type=str, default="fixed",
-                        choices=["fixed", "poisson", "wave"],
-                        help="Arrival mode: fixed, poisson, or wave (default: fixed)")
+    parser.add_argument("--stagger-mode", type=str, default="constant",
+                        choices=["constant", "bursty"],
+                        help="Simulation type: constant (uniform arrivals) or bursty (wave clusters) (default: constant)")
     parser.add_argument("--scheduler", type=str, default="fifo",
                         choices=ALL_SCHEDULERS)
     parser.add_argument("--schedulers", type=str, nargs="+",
