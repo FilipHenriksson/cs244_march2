@@ -4,12 +4,14 @@ from rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
 from trace import trace
 
 
-class AdaptiveSJFScheduler:
-    """Strategy 5: Shortest Job First using learned completion times.
+class CombinedMapReduceAdaptiveSJFScheduler:
+    """Combined strategy: group-aware priority (MapReduce) + learned durations (Adaptive SJF).
 
-    Maintains an EMA of actual wall-clock duration per call type.
-    Prioritizes calls with the shortest predicted duration.
-    Unseen call types get top priority (exploration over exploitation).
+    Priority score = predicted_duration * active_members_in_group (lower = better).
+    - Short jobs in nearly-complete groups get top priority.
+    - Singleton (reduce-phase) calls: pred * 1, no penalty.
+    - Unseen call types: 0.0 (exploration-first).
+    - As group members complete, remaining members' scores decrease (priority rises).
     """
 
     def __init__(self, limiter: RateLimiter):
@@ -19,38 +21,56 @@ class AdaptiveSJFScheduler:
         self._drain_task: asyncio.Task | None = None
         self._enqueue_counter = 0
 
-        # Learned duration tracking
-        self._ema: dict[str, float] = {}      # tracking_key -> EMA of duration (seconds)
-        self._counts: dict[str, int] = {}     # tracking_key -> observation count
-        self._alpha = 0.3                      # EMA smoothing factor
+        # Group tracking (from MapReduce)
+        self._group_active: dict[str, int] = {}
 
-    # --- Duration learning ---
+        # Duration learning (from Adaptive SJF)
+        self._ema: dict[str, float] = {}
+        self._counts: dict[str, int] = {}
+        self._alpha = 0.3
+
+    # --- Duration learning (from Adaptive SJF) ---
 
     @staticmethod
     def _tracking_key(call_type: str, detail: str) -> str:
-        """Compute the key for duration tracking.
-
-        agent_turn varies significantly by round, so we include the detail.
-        All other call types are tracked by bare name.
-        """
         if call_type == "agent_turn":
             return f"agent_turn:{detail}"
         return call_type
 
     def _predicted_duration(self, key: str) -> float:
-        """Return predicted duration for a tracking key. 0.0 for unseen (top priority)."""
         return self._ema.get(key, 0.0)
 
     def _record_duration(self, key: str, duration: float):
-        """Update EMA with a new observation."""
         if key not in self._ema:
             self._ema[key] = duration
             self._counts[key] = 1
         else:
             self._ema[key] = self._alpha * duration + (1 - self._alpha) * self._ema[key]
             self._counts[key] += 1
-        # Wake drain loop — priorities may have changed
         self._notify.set()
+
+    # --- Group lifecycle (from MapReduce) ---
+
+    def register_group(self, group_id: str, size: int):
+        self._group_active[group_id] = size
+
+    def deregister_member(self, group_id: str):
+        if group_id in self._group_active:
+            self._group_active[group_id] -= 1
+            if self._group_active[group_id] <= 0:
+                del self._group_active[group_id]
+            self._notify.set()
+
+    # --- Combined priority ---
+
+    def _effective_score(self, group_id: str | None, tracking_key: str) -> float:
+        """Lower score = higher priority."""
+        pred = self._predicted_duration(tracking_key)
+        if group_id is None:
+            active = 1
+        else:
+            active = self._group_active.get(group_id, 1)
+        return pred * active
 
     # --- Scheduler interface ---
 
@@ -65,16 +85,9 @@ class AdaptiveSJFScheduler:
             except asyncio.CancelledError:
                 pass
 
-    def register_group(self, group_id: str, size: int):
-        pass
-
-    def deregister_member(self, group_id: str):
-        pass
-
     async def submit(self, coro_factory, estimated_tokens: int,
                      agent_id: str, call_type: str, detail: str = "",
                      group_id: str = None):
-        """Enqueue a call. Priority computed dynamically from learned durations."""
         future = asyncio.get_event_loop().create_future()
         self._enqueue_counter += 1
         position = self._enqueue_counter
@@ -91,18 +104,17 @@ class AdaptiveSJFScheduler:
     # --- Internal ---
 
     def _pick_best(self) -> int | None:
-        """Return index of pending item with shortest predicted duration."""
         if not self._pending:
             return None
         best_idx = 0
-        best_pred = self._predicted_duration(self._pending[0][8])
+        best_score = self._effective_score(self._pending[0][7], self._pending[0][8])
         best_order = self._pending[0][6]
         for i in range(1, len(self._pending)):
-            pred = self._predicted_duration(self._pending[i][8])
+            score = self._effective_score(self._pending[i][7], self._pending[i][8])
             order = self._pending[i][6]
-            if pred < best_pred or (pred == best_pred and order < best_order):
+            if score < best_score or (score == best_score and order < best_order):
                 best_idx = i
-                best_pred = pred
+                best_score = score
                 best_order = order
         return best_idx
 
@@ -137,11 +149,11 @@ class AdaptiveSJFScheduler:
                     tpm_waits += 1
                 wait = await self.limiter.wait_time(est_tokens)
                 wait = max(wait, 0.1)
-                pred = self._predicted_duration(tracking_key)
-                print(f"  [ASJF] queue waiting {wait:.2f}s for capacity "
-                      f"(next: {agent_id}:{call_type}, pred={pred:.2f}s, reason={throttle})")
+                score = self._effective_score(group_id, tracking_key)
+                print(f"  [COMBINED] queue waiting {wait:.2f}s for capacity "
+                      f"(next: {agent_id}:{call_type}, score={score:.2f}, reason={throttle})")
                 await asyncio.sleep(wait)
-                # Re-pick after waiting — EMA may have updated
+                # Re-pick — both EMA and group membership may have changed
                 new_idx = self._pick_best()
                 if new_idx is None:
                     break

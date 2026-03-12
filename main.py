@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import logging
 import random
 
 from dotenv import load_dotenv
@@ -20,7 +21,9 @@ async def main():
     parser.add_argument("--random", action="store_true", help="Pick a random research prompt")
     parser.add_argument("--prompt", type=str, help="Custom research prompt")
     parser.add_argument("--scheduler", type=str, default="fifo",
-                        choices=["backoff", "fifo", "sjf", "mapreduce", "adaptive_sjf"],
+                        choices=["backoff", "fifo", "sjf", "mapreduce", "mapreduce_improved",
+                                 "adaptive_sjf", "token_sjf",
+                                 "combined_mapreduce_asjf", "combined_mapreduce_tsjf"],
                         help="Scheduling strategy (default: fifo)")
     parser.add_argument("--rpm", type=int, default=20,
                         help="Rate limit: requests per minute (default: 20)")
@@ -29,6 +32,10 @@ async def main():
     parser.add_argument("--cost-limit", type=float, default=15.0,
                         help="Hard cost cap in USD (default: 15.0)")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    for _name in ("openai", "httpx", "httpcore"):
+        logging.getLogger(_name).setLevel(logging.WARNING)
 
     if args.prompt:
         prompt = args.prompt
@@ -59,7 +66,7 @@ async def main():
 
     print(f"\n  Cost:")
     print(ct.cost_tracker.summary())
-    trace.print_summary()
+    trace.print_summary(rl_stats=limiter.stats)
 
 
 if __name__ == "__main__":

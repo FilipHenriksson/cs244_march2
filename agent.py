@@ -1,3 +1,15 @@
+"""Research agent — tool-use loop over a single sub-question.
+
+Each agent runs up to MAX_TOOL_ROUNDS iterations:
+  1. Send conversation history to the LLM with tool schemas
+  2. If the LLM returns tool calls -> execute them, append results, repeat
+  3. If the LLM returns plain text -> return it as the agent's findings
+
+Tools (web_search, summarize, analyze) are defined in tools.py; each makes
+its own LLM call, so a single agent round may produce multiple scheduler
+submissions.
+"""
+
 from llm import llm_call
 from tools import TOOL_SCHEMAS, execute_tool
 

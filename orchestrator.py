@@ -1,74 +1,40 @@
+"""Orchestration pipeline: breakdown -> agents -> synthesis -> reviewers -> finalize.
+
+Each orchestrate() call runs one research session through five stages:
+
+  1. Breakdown  — LLM splits the topic into NUM_AGENTS sub-questions
+  2. Fan-out    — parallel research agents investigate each sub-question (tool-use loop)
+  3. Synthesis  — LLM combines agent findings into a coherent draft
+  4. Fan-out    — parallel reviewers (citations, style, facts) critique the draft
+  5. Finalize   — LLM revises the draft incorporating reviewer feedback
+
+All LLM calls route through llm.llm_call(), which delegates to the active
+scheduler.  Fan-out stages register a "group" with the scheduler so that
+group-aware policies (e.g. MapReduce) can prioritize calls whose sibling
+tasks are nearest completion.
+"""
 
 import asyncio
-import llm as llm_mod
-from llm import llm_call
+from llm import llm_call, register_group, deregister_member
 from agent import run_agent
+from prompts import REVIEWER_CONFIGS
 
 NUM_AGENTS = 5
 
-REVIEWER_CONFIGS = [
-    {
-        "id_suffix": "r0",
-        "call_type": "review_citations",
-        "system_prompt": (
-            "You are a citation and source checker. You will receive a research "
-            "synthesis document. Your job is to:\n"
-            "1. Identify every factual claim in the text.\n"
-            "2. Check whether each claim is attributed to a source or left unsourced.\n"
-            "3. Flag any claims that lack citations or have vague attribution "
-            "(e.g., 'studies show' without specifics).\n"
-            "4. Suggest where additional citations would strengthen the text.\n\n"
-            "Return your findings as a structured list with the format:\n"
-            "- CLAIM: <the claim>\n"
-            "  STATUS: [cited | unsourced | vague]\n"
-            "  SUGGESTION: <optional improvement>\n\n"
-            "End with a brief overall assessment of citation quality."
-        ),
-    },
-    {
-        "id_suffix": "r1",
-        "call_type": "review_style",
-        "system_prompt": (
-            "You are a style and grammar editor. You will receive a research "
-            "synthesis document. Your job is to:\n"
-            "1. Identify grammar errors, awkward phrasing, or unclear sentences.\n"
-            "2. Check for consistent tone (formal academic style).\n"
-            "3. Flag any structural issues (poor transitions, missing topic sentences, "
-            "logical flow problems).\n"
-            "4. Suggest specific rewrites for any problematic passages.\n\n"
-            "Return your findings as a structured list with the format:\n"
-            "- ISSUE: <description of the problem>\n"
-            "  LOCATION: <quote the relevant text>\n"
-            "  SUGGESTION: <specific fix>\n\n"
-            "End with a brief overall assessment of writing quality."
-        ),
-    },
-    {
-        "id_suffix": "r2",
-        "call_type": "review_facts",
-        "system_prompt": (
-            "You are a fact checker. You will receive a research synthesis document. "
-            "Your job is to:\n"
-            "1. Identify every factual claim (statistics, dates, names, causal claims).\n"
-            "2. Assess whether each claim is plausible and internally consistent with "
-            "the rest of the document.\n"
-            "3. Flag any claims that appear incorrect, outdated, exaggerated, or "
-            "contradicted by other parts of the text.\n"
-            "4. Note any claims you cannot verify that should be double-checked.\n\n"
-            "Return your findings as a structured list with the format:\n"
-            "- CLAIM: <the claim>\n"
-            "  VERDICT: [plausible | questionable | likely incorrect | unverifiable]\n"
-            "  REASONING: <brief explanation>\n\n"
-            "End with a brief overall assessment of factual accuracy."
-        ),
-    },
-]
+
+def _parse_sub_questions(text: str) -> list[str]:
+    """Extract up to NUM_AGENTS sub-questions from numbered LLM output."""
+    questions = []
+    for line in text.strip().split("\n"):
+        cleaned = line.strip().lstrip("0123456789.)- ").strip()
+        if cleaned:
+            questions.append(cleaned)
+    return questions[:NUM_AGENTS]
 
 
-async def run_reviewer(synthesis_text: str, prompt: str, config: dict,
-                       session_id: int, group_id: str = None) -> str:
-    """Run a single review agent (no tools, single LLM call)."""
-    sid = f"s{session_id}"
+async def _run_reviewer(synthesis_text: str, prompt: str, config: dict,
+                        session_id: int, group_id: str = None) -> str:
+    """Single review pass — one LLM call, no tools."""
     resp = await llm_call(
         messages=[
             {"role": "system", "content": config["system_prompt"]},
@@ -80,18 +46,40 @@ async def run_reviewer(synthesis_text: str, prompt: str, config: dict,
                 ),
             },
         ],
-        agent_id=f"{sid}:{config['id_suffix']}",
+        agent_id=f"s{session_id}:{config['id_suffix']}",
         call_type=config["call_type"],
         group_id=group_id,
     )
     return resp.choices[0].message.content
 
 
+async def _fan_out(group_id: str, coros: list) -> list:
+    """Execute coroutines as a scheduler group, deregistering each on completion.
+
+    Group-aware schedulers (e.g. MapReduce) use the group membership count to
+    boost priority for calls whose fan-out peers are already done.  Each
+    coroutine's completion triggers deregister_member(), updating that count.
+    """
+    register_group(group_id, len(coros))
+
+    async def _with_cleanup(coro):
+        try:
+            return await coro
+        finally:
+            deregister_member(group_id)
+
+    return list(await asyncio.gather(*[_with_cleanup(c) for c in coros]))
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
 async def orchestrate(prompt: str, session_id: int = 0) -> str:
-    """Fan out to research agents, fan in to synthesize."""
+    """Run the full five-stage research pipeline for one session."""
     sid = f"s{session_id}"
 
-    # Step 1: Break topic into sub-questions
+    # Stage 1: Breakdown — split topic into sub-questions
     breakdown_resp = await llm_call(
         messages=[
             {
@@ -107,38 +95,20 @@ async def orchestrate(prompt: str, session_id: int = 0) -> str:
         agent_id=f"{sid}:orch",
         call_type="breakdown",
     )
-    sub_questions_text = breakdown_resp.choices[0].message.content
+    sub_questions = _parse_sub_questions(breakdown_resp.choices[0].message.content)
 
-    # Parse sub-questions
-    lines = [l.strip() for l in sub_questions_text.strip().split("\n") if l.strip()]
-    sub_questions = []
-    for line in lines:
-        cleaned = line.lstrip("0123456789.)- ").strip()
-        if cleaned:
-            sub_questions.append(cleaned)
-    sub_questions = sub_questions[:NUM_AGENTS]
-
-    # Step 2: Fan out
+    # Stage 2: Fan-out — parallel research agents
     agent_group = f"agents_s{session_id}"
-    llm_mod._scheduler.register_group(agent_group, len(sub_questions))
+    results = await _fan_out(agent_group, [
+        run_agent(q, i, session_id, group_id=agent_group)
+        for i, q in enumerate(sub_questions)
+    ])
 
-    async def _run_agent_wrapped(q, i, sid, gid):
-        try:
-            return await run_agent(q, i, sid, group_id=gid)
-        finally:
-            llm_mod._scheduler.deregister_member(gid)
-
-    results = await asyncio.gather(
-        *[_run_agent_wrapped(q, i, session_id, agent_group)
-          for i, q in enumerate(sub_questions)]
-    )
-
-    # Step 3: Fan in — synthesize
+    # Stage 3: Fan-in — synthesize findings
     findings = "\n\n".join(
         f"### Agent {i} — {sub_questions[i]}\n{result}"
         for i, result in enumerate(results)
     )
-
     synthesis_resp = await llm_call(
         messages=[
             {
@@ -157,32 +127,20 @@ async def orchestrate(prompt: str, session_id: int = 0) -> str:
         agent_id=f"{sid}:orch",
         call_type="synthesis",
     )
-
     synthesis_text = synthesis_resp.choices[0].message.content
 
-    # Step 4: Fan out — review
+    # Stage 4: Fan-out — parallel reviewers
     review_group = f"reviewers_s{session_id}"
-    llm_mod._scheduler.register_group(review_group, len(REVIEWER_CONFIGS))
+    review_results = await _fan_out(review_group, [
+        _run_reviewer(synthesis_text, prompt, cfg, session_id, group_id=review_group)
+        for cfg in REVIEWER_CONFIGS
+    ])
 
-    async def _run_reviewer_wrapped(synth, p, cfg, sid, gid):
-        try:
-            return await run_reviewer(synth, p, cfg, sid, group_id=gid)
-        finally:
-            llm_mod._scheduler.deregister_member(gid)
-
-    review_results = await asyncio.gather(
-        *[
-            _run_reviewer_wrapped(synthesis_text, prompt, config, session_id, review_group)
-            for config in REVIEWER_CONFIGS
-        ]
-    )
-
-    # Step 5: Fan in — finalize
+    # Stage 5: Fan-in — finalize with reviewer feedback
     review_feedback = "\n\n".join(
-        f"### {config['call_type'].replace('review_', '').replace('_', ' ').title()} Review\n{result}"
-        for config, result in zip(REVIEWER_CONFIGS, review_results)
+        f"### {cfg['call_type'].replace('review_', '').replace('_', ' ').title()} Review\n{result}"
+        for cfg, result in zip(REVIEWER_CONFIGS, review_results)
     )
-
     finalize_resp = await llm_call(
         messages=[
             {
@@ -214,5 +172,4 @@ async def orchestrate(prompt: str, session_id: int = 0) -> str:
         agent_id=f"{sid}:orch",
         call_type="finalize",
     )
-
     return finalize_resp.choices[0].message.content

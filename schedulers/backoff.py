@@ -1,6 +1,6 @@
 import asyncio
 import random
-from rate_limiter import RateLimiter
+from rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
 from trace import trace
 
 
@@ -29,21 +29,41 @@ class BackoffScheduler:
         """Submit a call. Retries with exponential backoff if rate limited."""
         backoff = 1.0
         retries = 0
+        rpm_waits = 0
+        tpm_waits = 0
 
         while True:
-            allowed = await self.limiter.try_acquire(estimated_tokens)
-            if allowed:
+            throttle = await self.limiter.try_acquire(estimated_tokens)
+            if throttle is None:
                 call = trace.start_call(agent_id, call_type, detail,
-                                        retries=retries)
-                result = await coro_factory()
-                trace.end_call(call)
-                return result
+                                        retries=retries,
+                                        rpm_waits=rpm_waits,
+                                        tpm_waits=tpm_waits)
+                try:
+                    result = await coro_factory()
+                    if hasattr(result, "usage") and result.usage is not None:
+                        await self.limiter.record_actual_usage(
+                            result.usage.prompt_tokens,
+                            result.usage.completion_tokens,
+                            estimated_tokens,
+                        )
+                    trace.end_call(call)
+                    return result
+                except Exception:
+                    await self.limiter.record_actual_usage(
+                        0, 0, estimated_tokens)
+                    trace.end_call(call)
+                    raise
 
-            # Rate limited — backoff with jitter
+            # Rate limited — track reason and backoff with jitter
+            if throttle == THROTTLE_RPM:
+                rpm_waits += 1
+            else:
+                tpm_waits += 1
             jitter = self._rng.uniform(0, backoff * 0.5)
             wait = backoff + jitter
             retries += 1
-            print(f"  [BACKOFF] {agent_id}:{call_type} rate limited, "
+            print(f"  [BACKOFF] {agent_id}:{call_type} rate limited ({throttle}), "
                   f"retry #{retries} in {wait:.2f}s")
             await asyncio.sleep(wait)
             backoff = min(backoff * 2, 30.0)
