@@ -173,6 +173,15 @@ class RateLimiter:
             "token_overestimate": self._total_estimated - self._total_actual,
         }
 
+    async def report_actual(self, estimated_tokens: int, actual_tokens: int):
+        """Adjust the token window after receiving real usage from the API."""
+        diff = actual_tokens - estimated_tokens
+        if diff == 0:
+            return
+        async with self._lock:
+            now = time.time()
+            self._token_log.append((now, diff))
+
     def reset(self):
         """Refill both buckets to capacity and zero all stats counters."""
         self._rpm_bucket = float(self.rpm)

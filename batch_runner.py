@@ -150,7 +150,11 @@ def generate_workload(sessions: int, stagger: float,
                       stagger_mode: str, seed: int) -> dict:
     """Pre-generate the full workload so every scheduler gets the same one."""
     rng = random.Random(seed)
-    prompts = [rng.choice(RESEARCH_PROMPTS) for _ in range(sessions)]
+    # Balanced assignment: equal copies of each prompt, then shuffle
+    copies = sessions // len(RESEARCH_PROMPTS)
+    remainder = sessions % len(RESEARCH_PROMPTS)
+    prompts = RESEARCH_PROMPTS * copies + RESEARCH_PROMPTS[:remainder]
+    rng.shuffle(prompts)
     arrivals = compute_arrival_times(sessions, stagger, stagger_mode, rng)
     return {"prompts": prompts, "arrivals": arrivals}
 
@@ -200,6 +204,10 @@ async def run_one_scheduler(scheduler_name: str, args, limiter: RateLimiter,
         await scheduler.stop()
 
     cost = ct.cost_tracker.total_cost if ct.cost_tracker else 0.0
+    failed_cost = [r for r in results if not r.success and "Cost limit" in (r.error or "")]
+    if failed_cost:
+        print(f"\n  *** WARNING: {len(failed_cost)} session(s) hit the cost limit! ***")
+        print(f"  *** Results for '{scheduler_name}' are INCOMPLETE — do not trust them. ***\n")
     print_aggregate_summary(results, ct.cost_tracker)
     trace.print_summary(rl_stats=limiter.stats)
     return results, cost
@@ -253,9 +261,9 @@ async def main():
     _configure_logging()
 
     if args.all_schedulers:
-        schedulers = ALL_SCHEDULERS
+        schedulers = list(ALL_SCHEDULERS)
     elif args.schedulers:
-        schedulers = args.schedulers
+        schedulers = list(args.schedulers)
     else:
         schedulers = [args.scheduler]
     set_max_tokens(args.max_tokens)
@@ -280,12 +288,24 @@ async def main():
 
     results_by_scheduler: dict[str, list[SessionResult]] = {}
     cost_by_scheduler: dict[str, float] = {}
+    incomplete_schedulers: list[str] = []
 
-    for sched_name in schedulers:
-        results, cost = await run_one_scheduler(
+    for i, sched_name in enumerate(schedulers):
+        if i > 0:
+            cooldown = 30
+            print(f"\n--- Cooldown: sleeping {cooldown}s between scheduler runs ---\n")
+            await asyncio.sleep(cooldown)
+        results, cost, was_incomplete = await run_one_scheduler(
             sched_name, args, limiter, workload, len(schedulers))
         results_by_scheduler[sched_name] = results
         cost_by_scheduler[sched_name] = cost
+        if was_incomplete:
+            incomplete_schedulers.append(sched_name)
+
+    if incomplete_schedulers:
+        print(f"\n*** ERROR: The following schedulers hit the cost limit and "
+              f"have INVALID results: {', '.join(incomplete_schedulers)} ***")
+        print(f"*** Increase --cost-limit and re-run. ***\n")
 
     if len(schedulers) > 1:
         print_comparison(results_by_scheduler, cost_by_scheduler)

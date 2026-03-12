@@ -14,6 +14,7 @@ scheduler instance.
 """
 
 import json
+import os
 from openai import AsyncOpenAI
 import cost_tracker as ct
 from cost_tracker import CostLimitExceeded
@@ -59,9 +60,7 @@ def estimate_tokens(messages, **kwargs) -> int:
     text = json.dumps(messages, default=str)
     if "tools" in kwargs:
         text += json.dumps(kwargs["tools"], default=str)
-    input_tokens = len(text) // 4
-    est_output = kwargs.get("max_tokens", _max_tokens)
-    return input_tokens + est_output
+    return len(text) // 4
 
 
 async def llm_call(messages, agent_id: str, call_type: str,
