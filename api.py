@@ -151,7 +151,8 @@ async def run_llm(session_id: str, req: RunLLMRequest):
         agent_id=f"session:{session_id}",
         call_type="run_llm",
     )
-    return RunLLMResponse(response=resp.choices[0].message.content)
+    content = resp.choices[0].message.content
+    return RunLLMResponse(response=content if content is not None else "")
 
 
 @app.post("/sessions/{session_id}/run_agent", response_model=RunAgentResponse)
@@ -201,7 +202,8 @@ async def run_agent(session_id: str, req: RunAgentRequest):
 
             # No tool calls — LLM produced final text answer
             if not msg.tool_calls:
-                return RunAgentResponse(response=msg.content)
+                content = msg.content
+                return RunAgentResponse(response=content if content is not None else "")
 
             messages.append(msg)
 
@@ -235,7 +237,8 @@ async def run_agent(session_id: str, req: RunAgentRequest):
         call_type="agent_turn",
         detail="final",
     )
-    return RunAgentResponse(response=final_resp.choices[0].message.content)
+    content = final_resp.choices[0].message.content
+    return RunAgentResponse(response=content if content is not None else "")
 
 
 @app.delete("/sessions/{session_id}", status_code=204)
