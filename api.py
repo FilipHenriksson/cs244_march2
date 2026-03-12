@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -142,7 +142,8 @@ async def start_session():
 
 
 @app.post("/sessions/{session_id}/run_llm", response_model=RunLLMResponse)
-async def run_llm(session_id: str, req: RunLLMRequest):
+async def run_llm(session_id: str, req: RunLLMRequest,
+                  x_openai_api_key: str | None = Header(None)):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -150,13 +151,15 @@ async def run_llm(session_id: str, req: RunLLMRequest):
         messages=[{"role": "user", "content": req.prompt}],
         agent_id=f"session:{session_id}",
         call_type="run_llm",
+        api_key=x_openai_api_key,
     )
     content = resp.choices[0].message.content
     return RunLLMResponse(response=content if content is not None else "")
 
 
 @app.post("/sessions/{session_id}/run_agent", response_model=RunAgentResponse)
-async def run_agent(session_id: str, req: RunAgentRequest):
+async def run_agent(session_id: str, req: RunAgentRequest,
+                    x_openai_api_key: str | None = Header(None)):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -196,6 +199,7 @@ async def run_agent(session_id: str, req: RunAgentRequest):
                 agent_id=aid,
                 call_type="agent_turn",
                 detail=f"round-{round_num}",
+                api_key=x_openai_api_key,
                 **kwargs,
             )
             msg = resp.choices[0].message
@@ -236,6 +240,7 @@ async def run_agent(session_id: str, req: RunAgentRequest):
         agent_id=aid,
         call_type="agent_turn",
         detail="final",
+        api_key=x_openai_api_key,
     )
     content = final_resp.choices[0].message.content
     return RunAgentResponse(response=content if content is not None else "")

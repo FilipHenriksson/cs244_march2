@@ -53,7 +53,7 @@ async def fetch_ratelimit_headers(max_tokens: int = 1) -> dict[str, str]:
 
 
 async def llm_call(messages, agent_id: str, call_type: str,
-                   detail: str = "", group_id: str = None, **kwargs):
+                   detail: str = "", group_id: str = None, api_key: str = None, **kwargs):
     """Single entry point for all LLM calls. Routes through the active scheduler."""
     kwargs.setdefault("max_tokens", _max_tokens)
     est_tokens = estimate_tokens(messages, **kwargs)
@@ -62,8 +62,10 @@ async def llm_call(messages, agent_id: str, call_type: str,
     if ct.cost_tracker is not None:
         await ct.cost_tracker.check()
 
+    _client = AsyncOpenAI(api_key=api_key) if api_key else client
+
     def coro_factory():
-        return client.chat.completions.create(
+        return _client.chat.completions.create(
             model=MODEL,
             messages=messages,
             **kwargs,
