@@ -4,12 +4,12 @@ from sim.rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
 from sim.trace import trace
 
 
-class FIFOScheduler:
-    """Strategy 2: Global FIFO queue. Drains respecting rate limits."""
+class SJFScheduler:
+    """Strategy 3: Shortest Job First priority queue ordered by input tokens."""
 
     def __init__(self, limiter: RateLimiter):
         self.limiter = limiter
-        self._queue: asyncio.Queue = asyncio.Queue()
+        self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
         self._drain_task: asyncio.Task | None = None
         self._enqueue_counter = 0
 
@@ -24,23 +24,32 @@ class FIFOScheduler:
             except asyncio.CancelledError:
                 pass
 
+    def register_group(self, group_id: str, size: int):
+        pass
+
+    def deregister_member(self, group_id: str):
+        pass
+
     async def submit(self, coro_factory, estimated_tokens: int,
-                     session_id: int, call_key: str, label: str = ""):
-        """Enqueue a call. Returns result when the call completes."""
+                     agent_id: str, call_type: str, detail: str = "",
+                     group_id: str = None):
+        """Enqueue a call, prioritized by estimated token count (ascending)."""
         future = asyncio.get_event_loop().create_future()
         self._enqueue_counter += 1
         position = self._enqueue_counter
         enqueue_time = time.time()
-        await self._queue.put((coro_factory, estimated_tokens, future,
-                               session_id, call_key, label, position,
+        priority = (estimated_tokens, self._enqueue_counter)
+        await self._queue.put((priority, coro_factory, future,
+                               agent_id, call_type, detail, position,
                                enqueue_time))
         return await future
 
     async def _drain(self):
         while True:
             item = await self._queue.get()
-            (coro_factory, est_tokens, future, session_id, call_key,
-             label, position, enqueue_time) = item
+            (priority, coro_factory, future, agent_id, call_type,
+             detail, position, enqueue_time) = item
+            est_tokens = priority[0]
 
             rpm_waits = 0
             tpm_waits = 0
@@ -54,14 +63,15 @@ class FIFOScheduler:
                     tpm_waits += 1
                 wait = await self.limiter.wait_time(est_tokens)
                 wait = max(wait, 0.1)
-                print(f"  [FIFO] queue waiting {wait:.2f}s for capacity "
-                      f"(next: s{session_id}:{call_key}, reason={throttle})")
+                print(f"  [SJF] queue waiting {wait:.2f}s for capacity "
+                      f"(next: {agent_id}:{call_type}, {est_tokens} tokens, reason={throttle})")
                 await asyncio.sleep(wait)
 
             queue_wait = time.time() - enqueue_time
-            call = trace.start_call(session_id, call_key, label,
+            call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
                                     queue_wait=queue_wait,
+                                    estimated_tokens=est_tokens,
                                     rpm_waits=rpm_waits,
                                     tpm_waits=tpm_waits)
             asyncio.create_task(

@@ -2,8 +2,8 @@ import asyncio
 import bisect
 import json
 import time
-from rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
-from trace import trace
+from sim.rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
+from sim.trace import trace
 
 
 class TokenSJFSkipScheduler:
@@ -60,8 +60,8 @@ class TokenSJFSkipScheduler:
 
     @staticmethod
     def _tracking_key(call_type: str, detail: str) -> str:
-        if call_type == "agent_turn":
-            return f"agent_turn:{detail}"
+        if call_type == "orchestrator":
+            return f"orchestrator:{detail}"
         return call_type
 
     def _predicted_output(self, key: str) -> float | None:

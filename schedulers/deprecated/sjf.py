@@ -1,7 +1,7 @@
 import asyncio
 import time
-from rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
-from trace import trace
+from sim.rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
+from sim.trace import trace
 
 
 class SJFScheduler:

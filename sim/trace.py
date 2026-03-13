@@ -5,11 +5,11 @@ from dataclasses import dataclass
 @dataclass
 class LLMCall:
     call_id: int
-    agent_id: str
-    call_type: str
+    session_id: int
+    call_key: str
     start: float
     end: float = 0.0
-    detail: str = ""
+    label: str = ""
     queue_wait: float = 0.0
     queue_position: int = 0
     estimated_tokens: int = 0
@@ -31,16 +31,16 @@ class Trace:
     def _elapsed(self, t: float) -> float:
         return t - self.t0
 
-    def start_call(self, agent_id: str, call_type: str, detail: str = "",
+    def start_call(self, session_id: int, call_key: str, label: str = "",
                    queue_wait: float = 0.0, queue_position: int = 0,
                    estimated_tokens: int = 0, retries: int = 0,
                    rpm_waits: int = 0, tpm_waits: int = 0) -> LLMCall:
         call = LLMCall(
             call_id=self._next_id,
-            agent_id=agent_id,
-            call_type=call_type,
+            session_id=session_id,
+            call_key=call_key,
             start=time.time(),
-            detail=detail,
+            label=label,
             queue_wait=queue_wait,
             queue_position=queue_position,
             estimated_tokens=estimated_tokens,
@@ -50,8 +50,8 @@ class Trace:
         )
         self._next_id += 1
         self.calls.append(call)
-        tag = f"[{agent_id}]"
-        label = f"{call_type}({detail})" if detail else call_type
+        tag = f"[s{session_id}]"
+        desc = f"{call_key}({label})" if label else call_key
         extras = []
         if queue_wait > 0.01:
             extras.append(f"waited {queue_wait:.2f}s")
@@ -64,14 +64,14 @@ class Trace:
         if queue_position > 0:
             extras.append(f"pos #{queue_position}")
         extra_str = f" ({', '.join(extras)})" if extras else ""
-        print(f"  {self._elapsed(call.start):6.2f}s {tag:<16} START {label}{extra_str}")
+        print(f"  {self._elapsed(call.start):6.2f}s {tag:<16} START {desc}{extra_str}")
         return call
 
     def end_call(self, call: LLMCall):
         call.end = time.time()
-        tag = f"[{call.agent_id}]"
-        label = f"{call.call_type}({call.detail})" if call.detail else call.call_type
-        print(f"  {self._elapsed(call.end):6.2f}s {tag:<16} END   {label} ({call.duration:.2f}s)")
+        tag = f"[s{call.session_id}]"
+        desc = f"{call.call_key}({call.label})" if call.label else call.call_key
+        print(f"  {self._elapsed(call.end):6.2f}s {tag:<16} END   {desc} ({call.duration:.2f}s)")
 
     def print_summary(self, rl_stats: dict = None):
         total = time.time() - self.t0
@@ -81,22 +81,22 @@ class Trace:
         print(f" Total wall time: {total:.2f}s")
         print(f" Total LLM calls: {len(self.calls)}")
 
-        # Calls per agent
-        agents = sorted(set(c.agent_id for c in self.calls))
-        print(f"\n Per agent:")
-        for a in agents:
-            ac = [c for c in self.calls if c.agent_id == a]
-            llm_t = sum(c.duration for c in ac)
-            retries = sum(c.retries for c in ac)
+        # Calls per session
+        sessions = sorted(set(c.session_id for c in self.calls))
+        print(f"\n Per session:")
+        for s in sessions:
+            sc = [c for c in self.calls if c.session_id == s]
+            llm_t = sum(c.duration for c in sc)
+            retries = sum(c.retries for c in sc)
             extra = f", {retries} retries" if retries else ""
-            print(f"   {a:<16} {len(ac)} calls, {llm_t:.2f}s LLM{extra}")
+            print(f"   s{s:<27} {len(sc)} calls, {llm_t:.2f}s LLM{extra}")
 
-        # Calls per type
-        types = sorted(set(c.call_type for c in self.calls))
-        print(f"\n Per call type:")
-        for t in types:
-            tc = [c for c in self.calls if c.call_type == t]
-            print(f"   {t:<16} {len(tc)} calls, {sum(c.duration for c in tc):.2f}s total")
+        # Calls per call_key
+        keys = sorted(set(c.call_key for c in self.calls))
+        print(f"\n Per call key:")
+        for k in keys:
+            kc = [c for c in self.calls if c.call_key == k]
+            print(f"   {k:<28} {len(kc)} calls, {sum(c.duration for c in kc):.2f}s total")
 
         # Retry stats (backoff scheduler)
         total_retries = sum(c.retries for c in self.calls)
@@ -118,13 +118,13 @@ class Trace:
                 print(f"   Total queue delay:  {total_wait:.2f}s")
                 print(f"   Mean queue delay:   {total_wait / len(waited_calls):.2f}s")
                 print(f"   Max queue delay:    {max(c.queue_wait for c in waited_calls):.2f}s")
-                types_waited = sorted(set(c.call_type for c in waited_calls))
-                if len(types_waited) > 1:
-                    print(f"   By call type:")
-                    for t in types_waited:
-                        tw = [c for c in waited_calls if c.call_type == t]
+                keys_waited = sorted(set(c.call_key for c in waited_calls))
+                if len(keys_waited) > 1:
+                    print(f"   By call key:")
+                    for k in keys_waited:
+                        tw = [c for c in waited_calls if c.call_key == k]
                         total_t = sum(c.queue_wait for c in tw)
-                        print(f"     {t:<18} {len(tw)} waited, "
+                        print(f"     {k:<28} {len(tw)} waited, "
                               f"{total_t:.2f}s total, max {max(c.queue_wait for c in tw):.2f}s")
                 total_rpm = sum(c.rpm_waits for c in self.calls)
                 total_tpm = sum(c.tpm_waits for c in self.calls)
@@ -139,6 +139,20 @@ class Trace:
             print(f"   Successful acquires: {rl_stats['total_acquires']}")
             print(f"   RPM throttles:       {rl_stats['rpm_throttles']}")
             print(f"   TPM throttles:       {rl_stats['tpm_throttles']}")
+            rpm_waits = rl_stats.get('rpm_waits', 0)
+            tpm_waits = rl_stats.get('tpm_waits', 0)
+            tpm_skips = rl_stats.get('tpm_skips', 0)
+            if rpm_waits or tpm_waits or tpm_skips:
+                print(f"   RPM waits (sched):   {rpm_waits}")
+                print(f"   TPM waits (sched):   {tpm_waits}")
+                print(f"   TPM skips:           {tpm_skips}")
+            rpm_total = rl_stats['rpm_throttles'] + rpm_waits
+            tpm_total = rl_stats['tpm_throttles'] + tpm_waits
+            if rpm_total > 0 or tpm_total > 0:
+                if rpm_total >= tpm_total:
+                    print(f"   >> Bottleneck: RPM ({rpm_total} vs {tpm_total} TPM)")
+                else:
+                    print(f"   >> Bottleneck: TPM ({tpm_total} vs {rpm_total} RPM)")
             if rl_stats['total_actual'] > 0:
                 print(f"   Token estimation:")
                 print(f"     Total estimated:   {rl_stats['total_estimated']:,}")
@@ -161,9 +175,9 @@ class Trace:
         for c in sorted(self.calls, key=lambda c: c.start):
             s = self._elapsed(c.start)
             e = self._elapsed(c.end)
-            tag = f"{c.agent_id}:{c.call_type}"
-            if c.detail:
-                tag += f"({c.detail[:20]})"
+            tag = f"s{c.session_id}:{c.call_key}"
+            if c.label:
+                tag += f"({c.label[:20]})"
             bar_start = int(s / total * width)
             bar_end = max(bar_start + 1, int(e / total * width))
             bar = " " * bar_start + "#" * (bar_end - bar_start) + " " * (width - bar_end)
@@ -171,6 +185,20 @@ class Trace:
 
         print(f"        {'0':}<{width}>{total:.1f}s")
         print(f"{'='*70}\n")
+
+    def get_stats(self) -> dict:
+        """Return computed metrics as a dict for comparison tables."""
+        total_wall = time.time() - self.t0
+        total_llm = sum(c.duration for c in self.calls)
+        waited = [c for c in self.calls if c.queue_wait > 0.01]
+        return {
+            "wall_time": total_wall,
+            "total_llm_calls": len(self.calls),
+            "total_llm_time": total_llm,
+            "parallelism": total_llm / total_wall if total_wall > 0 else 0,
+            "mean_queue_wait": (sum(c.queue_wait for c in waited) / len(waited)) if waited else 0,
+            "max_queue_wait": max((c.queue_wait for c in waited), default=0),
+        }
 
     def reset(self):
         """Clear all call history for a fresh run."""

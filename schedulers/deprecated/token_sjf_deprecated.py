@@ -1,8 +1,8 @@
 import asyncio
 import json
 import time
-from rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
-from trace import trace
+from sim.rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
+from sim.trace import trace
 
 
 class TokenSJFScheduler:
@@ -34,9 +34,9 @@ class TokenSJFScheduler:
 
     @staticmethod
     def _tracking_key(call_type: str, detail: str) -> str:
-        """Same bucketing as adaptive_sjf: agent_turn split by round."""
-        if call_type == "agent_turn":
-            return f"agent_turn:{detail}"
+        """Orchestrator calls split by round; all others tracked by bare name."""
+        if call_type == "orchestrator":
+            return f"orchestrator:{detail}"
         return call_type
 
     def _predicted_output(self, key: str) -> float | None:

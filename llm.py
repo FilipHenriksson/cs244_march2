@@ -4,26 +4,23 @@ All agent and orchestrator code calls llm_call() instead of the OpenAI client
 directly.  llm_call() handles:
   - Token estimation (for scheduler prioritization and rate-limiter budgeting)
   - Pre-flight cost checks (via cost_tracker)
-  - Routing through the active scheduler (backoff, FIFO, SJF, MapReduce, etc.)
+  - Routing through the active scheduler (backoff, FIFO, MapReduce, etc.)
   - Post-call cost recording
 
-The active scheduler is set once at startup by main.py / batch_runner.py via
-set_scheduler().  Group lifecycle helpers (register_group / deregister_member)
-are forwarded to the scheduler so that callers don't need direct access to the
-scheduler instance.
+The active scheduler is set once at startup by main.py / sim/runner.py via
+set_scheduler().
 """
 
 import json
 import os
 from openai import AsyncOpenAI
-import cost_tracker as ct
-from cost_tracker import CostLimitExceeded
+import sim.cost_tracker as ct
 
 MODEL = "gpt-4.1-nano"
 client = AsyncOpenAI()
 
 _scheduler = None          # set once at startup via set_scheduler()
-_max_tokens = 1024         # default output cap; overridable via set_max_tokens()
+_max_tokens = 2048         # default output cap; overridable via set_max_tokens()
 
 
 def set_scheduler(scheduler):
@@ -34,21 +31,6 @@ def set_scheduler(scheduler):
 def set_max_tokens(max_tokens: int):
     global _max_tokens
     _max_tokens = max_tokens
-
-
-# ---------------------------------------------------------------------------
-# Group lifecycle — forwarded to the active scheduler so that callers
-# (orchestrator.py) don't reach into _scheduler directly.
-# ---------------------------------------------------------------------------
-
-def register_group(group_id: str, size: int):
-    """Declare a fan-out group of *size* members with the active scheduler."""
-    _scheduler.register_group(group_id, size)
-
-
-def deregister_member(group_id: str):
-    """Signal that one member of a fan-out group has completed."""
-    _scheduler.deregister_member(group_id)
 
 
 # ---------------------------------------------------------------------------
@@ -63,14 +45,27 @@ def estimate_tokens(messages, **kwargs) -> int:
     return len(text) // 4
 
 
-async def llm_call(messages, agent_id: str, call_type: str,
-                   detail: str = "", group_id: str = None, **kwargs):
-    """Single entry point for all LLM calls.  Routes through the active scheduler."""
+async def llm_call(messages, session_id: int, call_key: str,
+                   label: str = "", **kwargs):
+    """Single entry point for all LLM calls.  Routes through the active scheduler.
+
+    Parameters
+    ----------
+    messages : list
+        OpenAI chat messages.
+    session_id : int
+        Which session this call belongs to (used for scheduler priority).
+    call_key : str
+        Call type identifier, e.g. ``"orchestrator:plan"``,
+        ``"analyst_web_research"``.  Used for token-learning EMA and logging.
+    label : str, optional
+        Human-readable context for log lines (e.g. truncated question text).
+    """
     kwargs.setdefault("max_tokens", _max_tokens)
 
     if hasattr(_scheduler, "estimate_total_tokens"):
         est_tokens = _scheduler.estimate_total_tokens(
-            messages, call_type, detail, **kwargs)
+            messages, call_key, **kwargs)
     else:
         est_tokens = estimate_tokens(messages, **kwargs)
 
@@ -85,8 +80,7 @@ async def llm_call(messages, agent_id: str, call_type: str,
         )
 
     response = await _scheduler.submit(
-        coro_factory, est_tokens, agent_id, call_type, detail,
-        group_id=group_id,
+        coro_factory, est_tokens, session_id, call_key, label,
     )
 
     if ct.cost_tracker is not None and response.usage is not None:

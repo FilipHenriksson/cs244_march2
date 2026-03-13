@@ -1,7 +1,7 @@
 import asyncio
 import time
-from rate_limiter import RateLimiter
-from trace import trace
+from sim.rate_limiter import RateLimiter, THROTTLE_RPM, THROTTLE_TPM
+from sim.trace import trace
 
 
 class CombinedMapReduceAdaptiveSJFScheduler:
@@ -33,8 +33,8 @@ class CombinedMapReduceAdaptiveSJFScheduler:
 
     @staticmethod
     def _tracking_key(call_type: str, detail: str) -> str:
-        if call_type == "agent_turn":
-            return f"agent_turn:{detail}"
+        if call_type == "orchestrator":
+            return f"orchestrator:{detail}"
         return call_type
 
     def _predicted_duration(self, key: str) -> float:
@@ -92,9 +92,11 @@ class CombinedMapReduceAdaptiveSJFScheduler:
         self._enqueue_counter += 1
         position = self._enqueue_counter
         tracking_key = self._tracking_key(call_type, detail)
+        enqueue_time = time.time()
         self._pending.append((
             coro_factory, estimated_tokens, future,
-            agent_id, call_type, detail, position, group_id, tracking_key
+            agent_id, call_type, detail, position, group_id,
+            tracking_key, enqueue_time
         ))
         self._notify.set()
         return await future
@@ -131,14 +133,25 @@ class CombinedMapReduceAdaptiveSJFScheduler:
             item = self._pending[idx]
             (coro_factory, est_tokens, future,
              agent_id, call_type, detail, position,
-             group_id, tracking_key) = item
+             group_id, tracking_key, enqueue_time) = item
 
-            while not await self.limiter.try_acquire(est_tokens):
-                wait = await self.limiter.wait_time()
+            rpm_waits = 0
+            tpm_waits = 0
+            acquired = False
+            while True:
+                throttle = await self.limiter.try_acquire(est_tokens)
+                if throttle is None:
+                    acquired = True
+                    break
+                if throttle == THROTTLE_RPM:
+                    rpm_waits += 1
+                else:
+                    tpm_waits += 1
+                wait = await self.limiter.wait_time(est_tokens)
                 wait = max(wait, 0.1)
                 score = self._effective_score(group_id, tracking_key)
                 print(f"  [COMBINED] queue waiting {wait:.2f}s for capacity "
-                      f"(next: {agent_id}:{call_type}, score={score:.2f})")
+                      f"(next: {agent_id}:{call_type}, score={score:.2f}, reason={throttle})")
                 await asyncio.sleep(wait)
                 # Re-pick — both EMA and group membership may have changed
                 new_idx = self._pick_best()
@@ -147,22 +160,39 @@ class CombinedMapReduceAdaptiveSJFScheduler:
                 item = self._pending[new_idx]
                 (coro_factory, est_tokens, future,
                  agent_id, call_type, detail, position,
-                 group_id, tracking_key) = item
+                 group_id, tracking_key, enqueue_time) = item
                 idx = new_idx
 
+            if not acquired:
+                continue
+
             self._pending.pop(idx)
+            queue_wait = time.time() - enqueue_time
             call = trace.start_call(agent_id, call_type, detail,
                                     queue_position=position,
-                                    estimated_tokens=est_tokens)
-            asyncio.create_task(self._run(coro_factory, future, call, tracking_key))
+                                    queue_wait=queue_wait,
+                                    estimated_tokens=est_tokens,
+                                    rpm_waits=rpm_waits,
+                                    tpm_waits=tpm_waits)
+            asyncio.create_task(
+                self._run(coro_factory, future, call, tracking_key,
+                          est_tokens))
 
-    async def _run(self, coro_factory, future, call, tracking_key: str):
+    async def _run(self, coro_factory, future, call, tracking_key: str,
+                   est_tokens: int):
         try:
             t0 = time.time()
             result = await coro_factory()
+            if hasattr(result, "usage") and result.usage is not None:
+                await self.limiter.record_actual_usage(
+                    result.usage.prompt_tokens,
+                    result.usage.completion_tokens,
+                    est_tokens,
+                )
             self._record_duration(tracking_key, time.time() - t0)
             trace.end_call(call)
             future.set_result(result)
         except Exception as e:
+            await self.limiter.record_actual_usage(0, 0, est_tokens)
             trace.end_call(call)
             future.set_exception(e)
