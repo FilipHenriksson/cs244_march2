@@ -157,17 +157,15 @@ _ANALYSTS = [
 
 def _make_analyst_fn(name: str, system_prompt: str):
     """Create an async tool function for one analyst."""
-    async def _analyst(arguments: dict, agent_id: str,
-                       group_id: str = None) -> str:
+    async def _analyst(arguments: dict, session_id: int) -> str:
         resp = await llm_call(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": arguments["question"]},
             ],
-            agent_id=agent_id,
-            call_type=name,
-            detail=arguments["question"][:40],
-            group_id=group_id,
+            session_id=session_id,
+            call_key=name,
+            label=arguments["question"][:40],
         )
         return resp.choices[0].message.content
     return _analyst

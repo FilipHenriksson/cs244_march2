@@ -23,9 +23,7 @@ from schedulers import get_scheduler
 from llm import set_scheduler
 
 ALL_SCHEDULERS = [
-    "backoff", "fifo", "sjf", "mapreduce", "mapreduce_improved",
-    "adaptive_sjf", "token_sjf", "token_sjf_skip",
-    "combined_mapreduce_asjf", "combined_mapreduce_tsjf",
+    "backoff", "fifo", "mapreduce", "mapreduce_skip", "mapreduce_skip_adaptive",
 ]
 
 

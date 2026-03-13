@@ -17,7 +17,7 @@ Strict mode:
 import asyncio
 import json
 from dataclasses import dataclass
-from llm import llm_call, register_group, deregister_member
+from llm import llm_call
 from tools import ALL_TOOL_SCHEMAS, execute_tool, ANALYST_TOOLS, REVIEWER_TOOLS
 from prompts import ORCHESTRATOR_SYSTEM_PROMPT
 
@@ -45,29 +45,21 @@ class AgentResult:
 
 async def _run_strict(prompt: str, session_id: int) -> AgentResult:
     """Run the strict 5-step pipeline with deterministic call counts."""
-    sid = f"s{session_id}"
     system = {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT}
     messages = [system, {"role": "user", "content": prompt}]
 
     # Step 1: Orchestrator plans the research
     resp = await llm_call(
-        messages=messages, agent_id=f"{sid}:orch",
-        call_type="orchestrator", detail="plan",
+        messages=messages, session_id=session_id,
+        call_key="orchestrator:plan",
     )
     messages.append({"role": "assistant", "content": resp.choices[0].message.content})
 
     # Step 2: Fan out 5 analysts in parallel
-    group_id = f"analysts_{sid}"
-    register_group(group_id, len(STRICT_ANALYSTS))
-
     async def _run_analyst(name):
-        try:
-            return name, await ANALYST_TOOLS[name](
-                {"question": prompt}, agent_id=f"{sid}:{name}",
-                group_id=group_id,
-            )
-        finally:
-            deregister_member(group_id)
+        return name, await ANALYST_TOOLS[name](
+            {"question": prompt}, session_id=session_id,
+        )
 
     analyst_results = await asyncio.gather(
         *[_run_analyst(n) for n in STRICT_ANALYSTS])
@@ -81,24 +73,17 @@ async def _run_strict(prompt: str, session_id: int) -> AgentResult:
 
     # Step 3: Orchestrator drafts synthesis
     resp = await llm_call(
-        messages=messages, agent_id=f"{sid}:orch",
-        call_type="orchestrator", detail="synthesize",
+        messages=messages, session_id=session_id,
+        call_key="orchestrator:synthesize",
     )
     draft = resp.choices[0].message.content
     messages.append({"role": "assistant", "content": draft})
 
     # Step 4: Fan out 3 reviewers in parallel
-    group_id = f"reviewers_{sid}"
-    register_group(group_id, len(STRICT_REVIEWERS))
-
     async def _run_reviewer(name):
-        try:
-            return name, await REVIEWER_TOOLS[name](
-                {"text": draft}, agent_id=f"{sid}:{name}",
-                group_id=group_id,
-            )
-        finally:
-            deregister_member(group_id)
+        return name, await REVIEWER_TOOLS[name](
+            {"text": draft}, session_id=session_id,
+        )
 
     reviewer_results = await asyncio.gather(
         *[_run_reviewer(n) for n in STRICT_REVIEWERS])
@@ -112,8 +97,8 @@ async def _run_strict(prompt: str, session_id: int) -> AgentResult:
 
     # Step 5: Orchestrator final synthesis
     resp = await llm_call(
-        messages=messages, agent_id=f"{sid}:orch",
-        call_type="orchestrator", detail="final",
+        messages=messages, session_id=session_id,
+        call_key="orchestrator:final",
     )
 
     n_analysts = len(STRICT_ANALYSTS)
@@ -129,22 +114,11 @@ async def _run_strict(prompt: str, session_id: int) -> AgentResult:
 # Default mode — LLM-driven tool-use loop
 # ---------------------------------------------------------------------------
 
-async def _fan_out_tool_calls(tool_calls, session_id: int,
-                              round_num: int) -> list[dict]:
-    """Execute a batch of tool_calls in parallel as a scheduler group."""
-    group_id = f"round{round_num}_s{session_id}"
-    register_group(group_id, len(tool_calls))
-
+async def _fan_out_tool_calls(tool_calls, session_id: int) -> list[dict]:
+    """Execute a batch of tool_calls in parallel."""
     async def _run_one(tc):
-        try:
-            args = json.loads(tc.function.arguments)
-            return await execute_tool(
-                tc.function.name, args,
-                agent_id=f"s{session_id}:{tc.function.name}",
-                group_id=group_id,
-            )
-        finally:
-            deregister_member(group_id)
+        args = json.loads(tc.function.arguments)
+        return await execute_tool(tc.function.name, args, session_id=session_id)
 
     results = await asyncio.gather(*[_run_one(tc) for tc in tool_calls])
     return [
@@ -166,9 +140,8 @@ async def _run_default(prompt: str, session_id: int) -> AgentResult:
     for round_num in range(MAX_ROUNDS):
         resp = await llm_call(
             messages=messages,
-            agent_id=f"s{session_id}:orch",
-            call_type="orchestrator",
-            detail=f"round-{round_num}",
+            session_id=session_id,
+            call_key=f"orchestrator:round-{round_num}",
             tools=ALL_TOOL_SCHEMAS,
         )
         orch_calls += 1
@@ -178,7 +151,7 @@ async def _run_default(prompt: str, session_id: int) -> AgentResult:
             total_tool_calls += len(msg.tool_calls)
             messages.append(msg)
             tool_results = await _fan_out_tool_calls(
-                msg.tool_calls, session_id, round_num,
+                msg.tool_calls, session_id,
             )
             messages.extend(tool_results)
             continue
@@ -192,9 +165,8 @@ async def _run_default(prompt: str, session_id: int) -> AgentResult:
     # Exhausted rounds — force a final text-only call
     resp = await llm_call(
         messages=messages,
-        agent_id=f"s{session_id}:orch",
-        call_type="orchestrator",
-        detail="final",
+        session_id=session_id,
+        call_key="orchestrator:final",
     )
     orch_calls += 1
     return AgentResult(

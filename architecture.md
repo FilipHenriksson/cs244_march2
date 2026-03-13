@@ -115,13 +115,16 @@ All 5 active schedulers implement the same interface:
 class Scheduler:
     def start(self)
     async def stop(self)
-    def register_group(group_id, size)
-    def deregister_member(group_id)
-    async def submit(coro_factory, est_tokens, agent_id, call_type, detail, group_id)
+    async def submit(coro_factory, est_tokens, session_id, call_key, label="")
 ```
 
-Swapped in at startup via `llm.set_scheduler()`. Fan-out groups are registered
-so group-aware schedulers can boost priority for the last calls in a group.
+Parameters:
+- `session_id: int` — which session this call belongs to (used for MapReduce priority)
+- `call_key: str` — call type identifier, e.g. `"orchestrator:plan"`, `"analyst_web_research"` (used for token-learning EMA and logging)
+- `label: str` — optional human-readable context for log lines
+
+Swapped in at startup via `llm.set_scheduler()`. Group-aware schedulers
+track active calls per session internally to boost priority for stragglers.
 
 **Active schedulers:**
 

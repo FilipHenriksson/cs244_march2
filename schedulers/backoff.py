@@ -17,15 +17,8 @@ class BackoffScheduler:
     async def stop(self):
         pass
 
-    def register_group(self, group_id: str, size: int):
-        pass
-
-    def deregister_member(self, group_id: str):
-        pass
-
     async def submit(self, coro_factory, estimated_tokens: int,
-                     agent_id: str, call_type: str, detail: str = "",
-                     group_id: str = None):
+                     session_id: int, call_key: str, label: str = ""):
         """Submit a call. Retries with exponential backoff if rate limited."""
         backoff = 1.0
         retries = 0
@@ -35,7 +28,7 @@ class BackoffScheduler:
         while True:
             throttle = await self.limiter.try_acquire(estimated_tokens)
             if throttle is None:
-                call = trace.start_call(agent_id, call_type, detail,
+                call = trace.start_call(session_id, call_key, label,
                                         retries=retries,
                                         rpm_waits=rpm_waits,
                                         tpm_waits=tpm_waits)
@@ -55,7 +48,6 @@ class BackoffScheduler:
                     trace.end_call(call)
                     raise
 
-            # Rate limited — track reason and backoff with jitter
             if throttle == THROTTLE_RPM:
                 rpm_waits += 1
             else:
@@ -63,7 +55,7 @@ class BackoffScheduler:
             jitter = self._rng.uniform(0, backoff * 0.5)
             wait = backoff + jitter
             retries += 1
-            print(f"  [BACKOFF] {agent_id}:{call_type} rate limited ({throttle}), "
+            print(f"  [BACKOFF] s{session_id}:{call_key} rate limited ({throttle}), "
                   f"retry #{retries} in {wait:.2f}s")
             await asyncio.sleep(wait)
             backoff = min(backoff * 2, 30.0)

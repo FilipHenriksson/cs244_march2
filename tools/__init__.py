@@ -17,10 +17,9 @@ ALL_TOOL_SCHEMAS = ANALYST_SCHEMAS + REVIEWER_SCHEMAS
 _DISPATCH = {**ANALYST_TOOLS, **REVIEWER_TOOLS}
 
 
-async def execute_tool(name: str, arguments: dict, agent_id: str,
-                       group_id: str = None) -> str:
+async def execute_tool(name: str, arguments: dict, session_id: int) -> str:
     """Dispatch a tool call to the appropriate analyst or reviewer."""
     fn = _DISPATCH.get(name)
     if fn is None:
         return f"Unknown tool: {name}"
-    return await fn(arguments, agent_id, group_id=group_id)
+    return await fn(arguments, session_id)

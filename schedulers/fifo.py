@@ -24,30 +24,23 @@ class FIFOScheduler:
             except asyncio.CancelledError:
                 pass
 
-    def register_group(self, group_id: str, size: int):
-        pass
-
-    def deregister_member(self, group_id: str):
-        pass
-
     async def submit(self, coro_factory, estimated_tokens: int,
-                     agent_id: str, call_type: str, detail: str = "",
-                     group_id: str = None):
+                     session_id: int, call_key: str, label: str = ""):
         """Enqueue a call. Returns result when the call completes."""
         future = asyncio.get_event_loop().create_future()
         self._enqueue_counter += 1
         position = self._enqueue_counter
         enqueue_time = time.time()
         await self._queue.put((coro_factory, estimated_tokens, future,
-                               agent_id, call_type, detail, position,
+                               session_id, call_key, label, position,
                                enqueue_time))
         return await future
 
     async def _drain(self):
         while True:
             item = await self._queue.get()
-            (coro_factory, est_tokens, future, agent_id, call_type,
-             detail, position, enqueue_time) = item
+            (coro_factory, est_tokens, future, session_id, call_key,
+             label, position, enqueue_time) = item
 
             rpm_waits = 0
             tpm_waits = 0
@@ -62,11 +55,11 @@ class FIFOScheduler:
                 wait = await self.limiter.wait_time(est_tokens)
                 wait = max(wait, 0.1)
                 print(f"  [FIFO] queue waiting {wait:.2f}s for capacity "
-                      f"(next: {agent_id}:{call_type}, reason={throttle})")
+                      f"(next: s{session_id}:{call_key}, reason={throttle})")
                 await asyncio.sleep(wait)
 
             queue_wait = time.time() - enqueue_time
-            call = trace.start_call(agent_id, call_type, detail,
+            call = trace.start_call(session_id, call_key, label,
                                     queue_position=position,
                                     queue_wait=queue_wait,
                                     rpm_waits=rpm_waits,

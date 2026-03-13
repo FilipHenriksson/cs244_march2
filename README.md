@@ -84,11 +84,14 @@ All 5 active schedulers implement the same interface:
 def start()                                    # start background drain task
 async def stop()                               # graceful shutdown
 async def submit(coro_factory, est_tokens,     # submit an LLM call
-                 agent_id, call_type, detail,
-                 group_id=None) -> response
-def register_group(group_id, size)             # declare a fan-out group
-def deregister_member(group_id)                # one group member completed
+                 session_id, call_key,
+                 label="") -> response
 ```
+
+Parameters:
+- `session_id: int` — which session this call belongs to (used for MapReduce priority)
+- `call_key: str` — call type identifier, e.g. `"orchestrator:plan"`, `"analyst_web_research"` (used for token-learning EMA and logging)
+- `label: str` — optional human-readable context for log lines
 
 ### 1. Backoff
 
@@ -100,7 +103,7 @@ def deregister_member(group_id)                # one group member completed
 
 ### 3. MapReduce
 
-**Strategy**: Group-completion-aware priority. Priority = `1 / active_calls_in_session`. As fan-out members complete, remaining members' priority increases (e.g., last analyst gets priority 1.0 vs 1/5 when all 5 were active). Groups are inferred automatically from session prefixes in agent_id. Accelerates fan-in barrier completion.
+**Strategy**: Group-completion-aware priority. Priority = `1 / active_calls_in_session`. As fan-out members complete, remaining members' priority increases (e.g., last analyst gets priority 1.0 vs 1/5 when all 5 were active). Session identity is provided directly via `session_id`. Accelerates fan-in barrier completion.
 
 ### 4. MapReduce Skip
 
@@ -147,7 +150,7 @@ Score = `predicted_output_tokens x active_members_in_group` (lower = better). Ai
 **Combined MapReduce + Adaptive SJF** — `schedulers/deprecated/combined_mapreduce_tsjf_deprecated.py`
 Score = `predicted_duration x active_members_in_group`. Same idea as the token variant but using wall-clock duration EMA. Performed worse because duration predictions are noisier and less correlated with the actual resource consumed (tokens) by the rate limiter — the scheduler optimized a proxy that didn't align with the constraint.
 
-**MapReduce Improved vs MapReduce (original)** — Both survived but were consolidated. The original MapReduce used explicit `register_group`/`deregister_member` calls. MapReduce Improved inferred groups from session prefixes in agent_id. In the strict pipeline where phases are sequential within a session, these produce identical behavior — the ~5s difference (1.6%) was noise. We kept the improved version (auto-inference) for its simpler API and renamed it to just "MapReduce".
+**MapReduce Improved vs MapReduce (original)** — Both survived but were consolidated. The original required callers to manually register and deregister fan-out groups; the improved version inferred groups automatically. In the strict pipeline where phases are sequential within a session, these produce identical behavior — the ~5s difference (1.6%) was noise. We kept the improved version, renamed it to "MapReduce", and now pass `session_id: int` directly so the scheduler tracks active calls per session without any lifecycle boilerplate.
 
 ### Key Insight
 
@@ -203,7 +206,7 @@ python -m sim.runner --all-schedulers --sessions 30 --output-dir results/
 |------|---------|-------------|
 | `--scheduler` | `fifo` | Single scheduler to run |
 | `--schedulers` | -- | List of schedulers to compare |
-| `--all-schedulers` | -- | Run all 4 schedulers |
+| `--all-schedulers` | -- | Run all 5 schedulers |
 | `--sessions` | `15` | Number of research sessions |
 | `--stagger` | `4.0` | Mean seconds between arrivals |
 | `--stagger-mode` | `constant` | `constant` (uniform arrivals) or `bursty` (wave clusters) |

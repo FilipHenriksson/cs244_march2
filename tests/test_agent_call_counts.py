@@ -49,16 +49,14 @@ def test_strict_mode_call_counts():
     """Strict mode: 3 orch + 5 analyst + 3 reviewer = 11 LLM calls, 8 tool calls."""
     call_log = []
 
-    async def mock_llm_call(messages, agent_id, call_type, detail="",
-                            group_id=None, **kwargs):
-        call_log.append((agent_id, call_type, detail))
-        return _make_response(content=f"Response from {call_type}:{detail}")
+    async def mock_llm_call(messages, session_id, call_key, label="",
+                            **kwargs):
+        call_log.append((session_id, call_key, label))
+        return _make_response(content=f"Response from {call_key}")
 
     async def _run():
         call_log.clear()
         with patch("agent.llm_call", side_effect=mock_llm_call), \
-             patch("agent.register_group"), \
-             patch("agent.deregister_member"), \
              patch("agent.ANALYST_TOOLS", {
                  name: AsyncMock(return_value=f"Result from {name}")
                  for name in ["analyst_web_research", "analyst_summarizer",
@@ -79,11 +77,11 @@ def test_strict_mode_call_counts():
     assert isinstance(result, AgentResult)
 
     # Verify exact call pattern
-    orch_calls = [c for c in call_log if c[1] == "orchestrator"]
+    orch_calls = [c for c in call_log if c[1].startswith("orchestrator:")]
     assert len(orch_calls) == 3, f"Expected 3 orch calls, got {len(orch_calls)}"
-    assert orch_calls[0][2] == "plan"
-    assert orch_calls[1][2] == "synthesize"
-    assert orch_calls[2][2] == "final"
+    assert orch_calls[0][1] == "orchestrator:plan"
+    assert orch_calls[1][1] == "orchestrator:synthesize"
+    assert orch_calls[2][1] == "orchestrator:final"
 
     # Verify totals
     assert result.llm_calls == 11, f"Expected 11 llm_calls, got {result.llm_calls}"
@@ -95,18 +93,18 @@ def test_strict_mode_calls_correct_tools():
     called_analysts = []
     called_reviewers = []
 
-    async def mock_llm_call(messages, agent_id, call_type, detail="",
-                            group_id=None, **kwargs):
+    async def mock_llm_call(messages, session_id, call_key, label="",
+                            **kwargs):
         return _make_response(content="text")
 
     def make_mock_analyst(name):
-        async def fn(arguments, agent_id, group_id=None):
+        async def fn(arguments, session_id):
             called_analysts.append(name)
             return f"Result from {name}"
         return fn
 
     def make_mock_reviewer(name):
-        async def fn(arguments, agent_id, group_id=None):
+        async def fn(arguments, session_id):
             called_reviewers.append(name)
             return f"Result from {name}"
         return fn
@@ -115,8 +113,6 @@ def test_strict_mode_calls_correct_tools():
         called_analysts.clear()
         called_reviewers.clear()
         with patch("agent.llm_call", side_effect=mock_llm_call), \
-             patch("agent.register_group"), \
-             patch("agent.deregister_member"), \
              patch("agent.ANALYST_TOOLS", {
                  n: make_mock_analyst(n) for n in [
                      "analyst_web_research", "analyst_summarizer",
@@ -146,14 +142,14 @@ def test_strict_mode_passes_draft_to_reviewers():
     """Strict mode passes the orchestrator's draft synthesis to each reviewer."""
     reviewer_inputs = []
 
-    async def mock_llm_call(messages, agent_id, call_type, detail="",
-                            group_id=None, **kwargs):
-        if detail == "synthesize":
+    async def mock_llm_call(messages, session_id, call_key, label="",
+                            **kwargs):
+        if call_key == "orchestrator:synthesize":
             return _make_response(content="THE DRAFT SYNTHESIS")
         return _make_response(content="text")
 
     def make_mock_reviewer(name):
-        async def fn(arguments, agent_id, group_id=None):
+        async def fn(arguments, session_id):
             reviewer_inputs.append((name, arguments.get("text")))
             return "review feedback"
         return fn
@@ -161,8 +157,6 @@ def test_strict_mode_passes_draft_to_reviewers():
     async def _run():
         reviewer_inputs.clear()
         with patch("agent.llm_call", side_effect=mock_llm_call), \
-             patch("agent.register_group"), \
-             patch("agent.deregister_member"), \
              patch("agent.ANALYST_TOOLS", {
                  n: AsyncMock(return_value="analyst result")
                  for n in ["analyst_web_research", "analyst_summarizer",
@@ -203,25 +197,23 @@ REVIEWER_CALLS = [
 def test_default_mode_tracks_counts():
     """Default mode: LLM picks tools freely, verify counts are tracked."""
 
-    async def mock_llm_call(messages, agent_id, call_type, detail="",
-                            group_id=None, **kwargs):
-        if call_type == "orchestrator":
-            if "round-0" in detail:
+    async def mock_llm_call(messages, session_id, call_key, label="",
+                            **kwargs):
+        if call_key.startswith("orchestrator:"):
+            if "round-0" in call_key:
                 return _make_response(tool_calls=ANALYST_CALLS)
-            elif "round-1" in detail:
+            elif "round-1" in call_key:
                 return _make_response(tool_calls=REVIEWER_CALLS)
             else:
                 return _make_response(content="Final.")
         return _make_response(content="tool result")
 
-    async def mock_execute_tool(name, arguments, agent_id, group_id=None):
+    async def mock_execute_tool(name, arguments, session_id):
         return "tool result"
 
     async def _run():
         with patch("agent.llm_call", side_effect=mock_llm_call), \
-             patch("agent.execute_tool", side_effect=mock_execute_tool), \
-             patch("agent.register_group"), \
-             patch("agent.deregister_member"):
+             patch("agent.execute_tool", side_effect=mock_execute_tool):
             return await run_agent("Test topic", session_id=0,
                                    prompt_mode="default")
 
@@ -235,15 +227,13 @@ def test_default_mode_tracks_counts():
 def test_default_mode_immediate_answer():
     """If LLM returns text immediately, 1 LLM call, 0 tool calls."""
 
-    async def mock_llm_call(messages, agent_id, call_type, detail="",
-                            group_id=None, **kwargs):
+    async def mock_llm_call(messages, session_id, call_key, label="",
+                            **kwargs):
         return _make_response(content="Immediate answer.")
 
     async def _run():
         with patch("agent.llm_call", side_effect=mock_llm_call), \
-             patch("agent.execute_tool"), \
-             patch("agent.register_group"), \
-             patch("agent.deregister_member"):
+             patch("agent.execute_tool"):
             return await run_agent("Test topic", session_id=0)
 
     result = asyncio.run(_run())

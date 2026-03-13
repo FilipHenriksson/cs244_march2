@@ -74,17 +74,15 @@ _REVIEWERS = [
 
 def _make_reviewer_fn(name: str, system_prompt: str):
     """Create an async tool function for one reviewer."""
-    async def _reviewer(arguments: dict, agent_id: str,
-                        group_id: str = None) -> str:
+    async def _reviewer(arguments: dict, session_id: int) -> str:
         resp = await llm_call(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": arguments["text"]},
             ],
-            agent_id=agent_id,
-            call_type=name,
-            detail=name,
-            group_id=group_id,
+            session_id=session_id,
+            call_key=name,
+            label=name,
         )
         return resp.choices[0].message.content
     return _reviewer

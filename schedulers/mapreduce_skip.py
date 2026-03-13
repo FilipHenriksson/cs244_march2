@@ -1,16 +1,13 @@
 """MapReduce scheduler with TPM-aware skipping.
 
-Combines MapReduce group-completion priority (priority = 1 / active_in_session)
-with the skip logic from TokenSJFSkip: when the highest-priority item can't
-fit the current TPM budget, the scheduler searches for a lower-priority item
-that *does* fit, rather than blocking the entire queue.
+Combines MapReduce session-priority (priority = 1 / active_in_session)
+with skip logic: when the highest-priority item can't fit the current TPM
+budget, the scheduler searches for a lower-priority item that *does* fit,
+rather than blocking the entire queue.
 
 A bisect-sorted index on estimated tokens enables O(log n) identification of
 which pending items fit the available TPM budget.  Among those, the best
 MapReduce-priority item is dispatched.
-
-This avoids the head-of-line blocking problem where a large orchestrator call
-(with accumulated context) blocks smaller analyst calls from being dispatched.
 """
 
 import asyncio
@@ -35,9 +32,7 @@ class MapReduceSkipScheduler:
     def __init__(self, limiter: RateLimiter):
         self.limiter = limiter
 
-        # Primary store: item_id -> item tuple
         self._items: dict[int, tuple] = {}
-        # Sorted index for TPM budget queries: list of (est_tokens, item_id)
         self._sorted_tokens: list[tuple[int, int]] = []
 
         self._notify: asyncio.Event = asyncio.Event()
@@ -45,82 +40,53 @@ class MapReduceSkipScheduler:
         self._next_id: int = 0
         self._enqueue_counter: int = 0
 
-        # Session tracking (MapReduce priority)
-        self._session_active: dict[str, int] = {}
+        self._session_active: dict[int, int] = {}
 
-        # Learned output-token tracking
         self._ema: dict[str, float] = {}
         self._counts: dict[str, int] = {}
         self._alpha = 0.3
 
-        # Drain-loop stats (try_acquire doesn't capture these for skip schedulers)
         self._tpm_skips: int = 0
         self._rpm_waits: int = 0
         self._tpm_waits: int = 0
 
-    # --- Backward-compatible no-ops ---
-
-    def register_group(self, group_id: str, size: int):
-        pass
-
-    def deregister_member(self, group_id: str):
-        pass
-
-    # --- Session key extraction ---
-
-    @staticmethod
-    def _session_key(agent_id: str) -> str | None:
-        if ":" in agent_id:
-            return agent_id.split(":")[0]
-        return None
-
     # --- Session tracking ---
 
-    def _track_submit(self, session: str | None):
-        if session is not None:
-            self._session_active[session] = self._session_active.get(session, 0) + 1
+    def _track_submit(self, session_id: int):
+        self._session_active[session_id] = self._session_active.get(session_id, 0) + 1
 
-    def _track_complete(self, session: str | None):
-        if session is not None:
-            count = self._session_active.get(session, 1) - 1
-            if count <= 0:
-                self._session_active.pop(session, None)
-            else:
-                self._session_active[session] = count
-            self._notify.set()
+    def _track_complete(self, session_id: int):
+        count = self._session_active.get(session_id, 1) - 1
+        if count <= 0:
+            self._session_active.pop(session_id, None)
+        else:
+            self._session_active[session_id] = count
+        self._notify.set()
 
     # --- Output-token learning ---
 
-    @staticmethod
-    def _tracking_key(call_type: str, detail: str) -> str:
-        if call_type == "orchestrator":
-            return f"orchestrator:{detail}"
-        return call_type
+    def _predicted_output(self, call_key: str) -> float | None:
+        return self._ema.get(call_key, None)
 
-    def _predicted_output(self, key: str) -> float | None:
-        return self._ema.get(key, None)
-
-    def _record_output(self, key: str, completion_tokens: int):
+    def _record_output(self, call_key: str, completion_tokens: int):
         tokens = float(completion_tokens)
-        if key not in self._ema:
-            self._ema[key] = tokens
-            self._counts[key] = 1
+        if call_key not in self._ema:
+            self._ema[call_key] = tokens
+            self._counts[call_key] = 1
         else:
-            self._ema[key] = self._alpha * tokens + (1 - self._alpha) * self._ema[key]
-            self._counts[key] += 1
+            self._ema[call_key] = self._alpha * tokens + (1 - self._alpha) * self._ema[call_key]
+            self._counts[call_key] += 1
         self._notify.set()
 
     # --- Token estimation (called by llm.py) ---
 
-    def estimate_total_tokens(self, messages, call_type: str,
-                              detail: str = "", **kwargs) -> int:
+    def estimate_total_tokens(self, messages, call_key: str, **kwargs) -> int:
         text = json.dumps(messages, default=str)
         if "tools" in kwargs:
             text += json.dumps(kwargs["tools"], default=str)
         input_tokens = len(text) // 4
 
-        key = self._tracking_key(call_type, detail)
-        pred = self._predicted_output(key)
+        pred = self._predicted_output(call_key)
         if pred is None:
             return input_tokens + kwargs.get("max_tokens", 1024)
         buffer = max(int(pred * self.BUFFER_RATIO), self.MIN_BUFFER)
@@ -128,14 +94,16 @@ class MapReduceSkipScheduler:
 
     # --- MapReduce priority ---
 
-    def _compute_priority(self, session: str | None) -> float:
+    def _compute_priority(self, session_id: int) -> float:
         """Higher value = higher priority. Range (0, 1]."""
-        if session is None:
-            return 1.0
-        active = self._session_active.get(session, 1)
+        active = self._session_active.get(session_id, 1)
         return 1.0 / max(active, 1)
 
     # --- Item management (dict + bisect-sorted index) ---
+    # Tuple layout: (coro_factory, est_tokens, future,
+    #                session_id, call_key, label, position, enqueue_time)
+    #   indices:      0            1           2
+    #                 3           4         5      6         7
 
     def _add_item(self, item: tuple) -> int:
         item_id = self._next_id
@@ -158,9 +126,9 @@ class MapReduceSkipScheduler:
         """Return (-priority, enqueue_order) for MapReduce comparison.
         Lower tuple = better (highest priority, earliest arrival)."""
         item = self._items[item_id]
-        session = item[7]  # session key
-        pri = self._compute_priority(session)
-        return (-pri, item[6])  # (negative priority, position)
+        session_id = item[3]
+        pri = self._compute_priority(session_id)
+        return (-pri, item[6])
 
     def _pick_best_mr(self) -> int | None:
         """Best MapReduce-priority item across all pending items."""
@@ -169,12 +137,7 @@ class MapReduceSkipScheduler:
         return min(self._items, key=self._mr_key)
 
     def _pick_best_fitting(self, budget: float) -> int | None:
-        """Best MapReduce-priority item whose est_tokens <= budget.
-
-        Uses bisect on the sorted token index to narrow candidates to
-        O(k) where k = number of items that fit, then picks best MR
-        priority among those.
-        """
+        """Best MapReduce-priority item whose est_tokens <= budget."""
         cutoff = bisect.bisect_right(
             self._sorted_tokens, (int(budget), float('inf'))
         )
@@ -205,19 +168,15 @@ class MapReduceSkipScheduler:
                 pass
 
     async def submit(self, coro_factory, estimated_tokens: int,
-                     agent_id: str, call_type: str, detail: str = "",
-                     group_id: str = None):
+                     session_id: int, call_key: str, label: str = ""):
         future = asyncio.get_event_loop().create_future()
         self._enqueue_counter += 1
         position = self._enqueue_counter
-        tracking_key = self._tracking_key(call_type, detail)
         enqueue_time = time.time()
-        session = self._session_key(agent_id)
-        self._track_submit(session)
+        self._track_submit(session_id)
         item = (
             coro_factory, estimated_tokens, future,
-            agent_id, call_type, detail, position, session,
-            tracking_key, enqueue_time
+            session_id, call_key, label, position, enqueue_time
         )
         self._add_item(item)
         self._notify.set()
@@ -241,7 +200,6 @@ class MapReduceSkipScheduler:
 
             rpm_ok, tpm_budget = await self.limiter.available_capacity()
 
-            # ---- RPM blocked: nothing can be dispatched ----
             if not rpm_ok:
                 self._rpm_waits += 1
                 wait = await self.limiter.wait_time(0)
@@ -249,13 +207,12 @@ class MapReduceSkipScheduler:
                 mr_id = self._pick_best_mr()
                 if mr_id is not None:
                     item = self._items[mr_id]
-                    pri = self._compute_priority(item[7])
+                    pri = self._compute_priority(item[3])
                     print(f"  [MR-S] rpm wait {wait:.2f}s "
-                          f"(next: {item[3]}:{item[4]}, pri={pri:.2f})")
+                          f"(next: s{item[3]}:{item[4]}, pri={pri:.2f})")
                 await self._interruptible_sleep(wait)
                 continue
 
-            # ---- Find best item that fits current TPM window ----
             mr_id = self._pick_best_mr()
             fit_id = self._pick_best_fitting(tpm_budget)
 
@@ -279,37 +236,34 @@ class MapReduceSkipScheduler:
             item = self._items[fit_id]
             est_tokens = item[1]
 
-            # Authoritative acquire (budget may have shifted slightly)
             throttle = await self.limiter.try_acquire(est_tokens)
             if throttle is not None:
                 await asyncio.sleep(0.05)
                 continue
 
-            # ---- Dispatch ----
             item = self._remove_item(fit_id)
             (coro_factory, est_tokens, future,
-             agent_id, call_type, detail, position,
-             session, tracking_key, enqueue_time) = item
+             session_id, call_key, label, position, enqueue_time) = item
 
             if skipped and mr_id in self._items:
                 mr_item = self._items[mr_id]
-                print(f"  [MR-S] skip: dispatching {agent_id}:{call_type} "
+                print(f"  [MR-S] skip: dispatching s{session_id}:{call_key} "
                       f"({est_tokens}tok) ahead of "
-                      f"{mr_item[3]}:{mr_item[4]} "
+                      f"s{mr_item[3]}:{mr_item[4]} "
                       f"({mr_item[1]}tok) "
                       f"[budget={tpm_budget:.0f}tok, "
                       f"total_skips={self._tpm_skips}]")
 
             queue_wait = time.time() - enqueue_time
-            call = trace.start_call(agent_id, call_type, detail,
+            call = trace.start_call(session_id, call_key, label,
                                     queue_position=position,
                                     queue_wait=queue_wait,
                                     estimated_tokens=est_tokens,
                                     rpm_waits=0,
                                     tpm_waits=0)
             asyncio.create_task(
-                self._run(coro_factory, future, call, tracking_key,
-                          est_tokens, session))
+                self._run(coro_factory, future, call, call_key,
+                          est_tokens, session_id))
 
     @property
     def stats(self) -> dict:
@@ -319,8 +273,8 @@ class MapReduceSkipScheduler:
             "tpm_skips": self._tpm_skips,
         }
 
-    async def _run(self, coro_factory, future, call, tracking_key: str,
-                   est_tokens: int, session: str | None):
+    async def _run(self, coro_factory, future, call, call_key: str,
+                   est_tokens: int, session_id: int):
         try:
             result = await coro_factory()
             if hasattr(result, "usage") and result.usage is not None:
@@ -330,7 +284,7 @@ class MapReduceSkipScheduler:
                     est_tokens,
                 )
                 if result.usage.completion_tokens is not None:
-                    self._record_output(tracking_key,
+                    self._record_output(call_key,
                                         result.usage.completion_tokens)
             trace.end_call(call)
             future.set_result(result)
@@ -339,4 +293,4 @@ class MapReduceSkipScheduler:
             trace.end_call(call)
             future.set_exception(e)
         finally:
-            self._track_complete(session)
+            self._track_complete(session_id)
