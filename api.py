@@ -8,6 +8,12 @@ POST   /sessions/{id}/completions           – submit one LLM call through the 
 POST   /sessions/{id}/completions/batch     – fan-out multiple LLM calls concurrently
 DELETE /sessions/{id}                       – tear down a session
 
+Simulation / benchmarking endpoints (not for production use)
+-------------------------------------------------------------
+GET    /sim/stats                           – server-side metrics snapshot
+POST   /sim/reset                           – reset state for a fresh benchmark run
+GET    /sim/config                          – current server configuration
+
 The server owns scheduling, rate limiting, and system-prompt caching.
 Clients drive their own agent loops and conversation state.
 
@@ -72,10 +78,12 @@ _sessions: dict[str, dict] = {}
 _next_int_id = 0
 
 # ---------------------------------------------------------------------------
-# Server-wide scheduler (set during lifespan)
+# Server-wide scheduler and rate limiter (set during lifespan)
 # ---------------------------------------------------------------------------
 
 _scheduler = None
+_limiter = None
+_active_scheduler_name = SCHEDULER_NAME
 
 # ---------------------------------------------------------------------------
 # Token estimation (mirrors llm.py logic)
@@ -142,9 +150,10 @@ async def _dispatch(messages: list[dict], session_int_id: int,
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _scheduler
-    limiter = RateLimiter(rpm=RPM, tpm=TPM)
-    _scheduler = get_scheduler(SCHEDULER_NAME, limiter)
+    global _scheduler, _limiter, _active_scheduler_name
+    _limiter = RateLimiter(rpm=RPM, tpm=TPM)
+    _active_scheduler_name = SCHEDULER_NAME
+    _scheduler = get_scheduler(_active_scheduler_name, _limiter)
     _scheduler.start()
     init_cost_tracker(COST_LIMIT)
     yield
@@ -276,3 +285,89 @@ async def delete_session(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     del _sessions[session_id]
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Simulation / benchmarking endpoints
+#
+# These endpoints expose server-side metrics and allow resetting state
+# between benchmark runs.  They are intended for simulation use only and
+# should NOT be exposed in a production deployment.
+# ---------------------------------------------------------------------------
+
+
+class SimResetRequest(BaseModel):
+    scheduler: str | None = None
+
+
+@app.get("/sim/config", tags=["simulation"])
+async def sim_config():
+    """Return current server configuration (simulation endpoint)."""
+    return {
+        "scheduler": _active_scheduler_name,
+        "rpm": RPM,
+        "tpm": TPM,
+        "max_tokens": MAX_TOKENS,
+        "cost_limit": COST_LIMIT,
+        "model": MODEL,
+    }
+
+
+@app.get("/sim/stats", tags=["simulation"])
+async def sim_stats():
+    """Snapshot of server-side metrics (simulation endpoint).
+
+    Returns rate-limiter counters, cost-tracker totals, scheduler stats,
+    and the number of active sessions.
+    """
+    rl = _limiter.stats if _limiter is not None else {}
+
+    cost = {}
+    if ct.cost_tracker is not None:
+        cost = {
+            "call_count": ct.cost_tracker.call_count,
+            "total_input_tokens": ct.cost_tracker.total_input_tokens,
+            "total_output_tokens": ct.cost_tracker.total_output_tokens,
+            "total_cost": ct.cost_tracker.total_cost,
+            "limit": ct.cost_tracker.limit,
+        }
+
+    sched_stats = {}
+    if _scheduler is not None and hasattr(_scheduler, "stats"):
+        sched_stats = _scheduler.stats
+
+    return {
+        "scheduler": _active_scheduler_name,
+        "rate_limiter": rl,
+        "cost": cost,
+        "scheduler_stats": sched_stats,
+        "active_sessions": len(_sessions),
+    }
+
+
+@app.post("/sim/reset", tags=["simulation"])
+async def sim_reset(req: SimResetRequest | None = None):
+    """Reset server state for a fresh benchmark run (simulation endpoint).
+
+    Stops the current scheduler, resets the rate limiter and cost tracker,
+    clears all sessions, and (optionally) switches to a different scheduler.
+    """
+    global _scheduler, _limiter, _active_scheduler_name, _sessions, _next_int_id
+
+    if _scheduler is not None:
+        await _scheduler.stop()
+
+    _limiter.reset()
+    init_cost_tracker(COST_LIMIT)
+    _sessions = {}
+    _next_int_id = 0
+
+    new_name = (req.scheduler if req and req.scheduler else _active_scheduler_name)
+    _active_scheduler_name = new_name
+    _scheduler = get_scheduler(_active_scheduler_name, _limiter)
+    _scheduler.start()
+
+    return {
+        "status": "reset",
+        "scheduler": _active_scheduler_name,
+    }
