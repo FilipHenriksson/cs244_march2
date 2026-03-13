@@ -175,6 +175,7 @@ async def main():
     async with httpx.AsyncClient(
         base_url=args.base_url,
         timeout=httpx.Timeout(args.timeout),
+        http2=True,
     ) as client:
         await register_call_types(client)
 

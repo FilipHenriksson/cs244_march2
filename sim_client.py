@@ -71,7 +71,7 @@ class SessionResult:
 
 async def register_call_types(base_url: str, timeout: float):
     async with httpx.AsyncClient(
-        base_url=base_url, timeout=httpx.Timeout(timeout),
+        base_url=base_url, timeout=httpx.Timeout(timeout), http2=True,
     ) as client:
         for name, system_prompt in ALL_CALL_TYPES.items():
             resp = await client.post("/call_types", json={
@@ -93,7 +93,7 @@ async def run_session(session_id: int, prompt: str, stagger_delay: float,
     start = time.time()
 
     async with httpx.AsyncClient(
-        base_url=base_url, timeout=httpx.Timeout(timeout),
+        base_url=base_url, timeout=httpx.Timeout(timeout), http2=True,
     ) as client:
         try:
             resp = await client.post("/sessions")
@@ -366,7 +366,7 @@ async def run_one_scheduler(scheduler_name: str, workload: dict,
 
     # Fetch server-side stats
     async with httpx.AsyncClient(
-        base_url=base_url, timeout=httpx.Timeout(timeout),
+        base_url=base_url, timeout=httpx.Timeout(timeout), http2=True,
     ) as client:
         resp = await client.get("/sim/stats")
         resp.raise_for_status()
@@ -422,7 +422,7 @@ async def main():
 
     # Set max_tokens and fetch server config
     async with httpx.AsyncClient(
-        base_url=args.base_url, timeout=httpx.Timeout(args.timeout),
+        base_url=args.base_url, timeout=httpx.Timeout(args.timeout), http2=True,
     ) as client:
         resp = await client.patch("/sim/config", json={"max_tokens": args.max_tokens})
         resp.raise_for_status()
@@ -456,7 +456,7 @@ async def main():
 
         # Reset server to this scheduler before each run
         async with httpx.AsyncClient(
-            base_url=args.base_url, timeout=httpx.Timeout(args.timeout),
+            base_url=args.base_url, timeout=httpx.Timeout(args.timeout), http2=True,
         ) as client:
             resp = await client.post("/sim/reset", json={"scheduler": sched_name})
             resp.raise_for_status()
