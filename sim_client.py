@@ -402,6 +402,8 @@ def _parse_args():
                         help="HTTP request timeout in seconds (default: 600)")
     parser.add_argument("--cooldown", type=float, default=5.0,
                         help="Seconds to sleep between scheduler runs (default: 5)")
+    parser.add_argument("--max-tokens", type=int, default=1024,
+                        help="Max tokens per completion; sets API server value once (default: 1024)")
     return parser.parse_args()
 
 
@@ -418,10 +420,12 @@ async def main():
     workload = generate_workload(args.sessions, args.stagger,
                                  args.stagger_mode, args.seed)
 
-    # Fetch and display server config
+    # Set max_tokens and fetch server config
     async with httpx.AsyncClient(
         base_url=args.base_url, timeout=httpx.Timeout(args.timeout),
     ) as client:
+        resp = await client.patch("/sim/config", json={"max_tokens": args.max_tokens})
+        resp.raise_for_status()
         resp = await client.get("/sim/config")
         resp.raise_for_status()
         config = resp.json()

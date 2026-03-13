@@ -13,6 +13,7 @@ Simulation / benchmarking endpoints (not for production use)
 GET    /sim/stats                           – server-side metrics snapshot
 POST   /sim/reset                           – reset state for a fresh benchmark run
 GET    /sim/config                          – current server configuration
+PATCH  /sim/config                          – update config (e.g. max_tokens)
 
 The server owns scheduling, rate limiting, and system-prompt caching.
 Clients drive their own agent loops and conversation state.
@@ -53,9 +54,11 @@ import sim.cost_tracker as ct
 SCHEDULER_NAME = os.getenv("SCHEDULER", "fifo")
 RPM = int(os.getenv("RPM", "30"))
 TPM = int(os.getenv("TPM", "200000"))
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2048"))
 COST_LIMIT = float(os.getenv("COST_LIMIT", "20.0"))
 MODEL = os.getenv("MODEL", "gpt-4.1-nano")
+
+# Mutable max_tokens (default from env; can be updated via PATCH /sim/config)
+_max_tokens = int(os.getenv("MAX_TOKENS", "2048"))
 
 # ---------------------------------------------------------------------------
 # OpenAI client (shared across all requests)
@@ -255,7 +258,7 @@ async def create_session():
 async def submit_completion(session_id: str, req: CompletionRequest):
     int_id = _resolve_session(session_id)
     messages = _build_messages(req.call_type, req.messages)
-    max_tokens = req.max_tokens or MAX_TOKENS
+    max_tokens = req.max_tokens or _max_tokens
     call_key = f"{req.call_type}:{req.call_detail}" if req.call_detail else req.call_type
     result = await _dispatch(messages, int_id, call_key, max_tokens)
     return CompletionResponse(**result)
@@ -271,7 +274,7 @@ async def submit_batch(session_id: str, req: BatchCompletionRequest):
 
     async def _one(call: CompletionRequest) -> dict:
         messages = _build_messages(call.call_type, call.messages)
-        max_tokens = call.max_tokens or MAX_TOKENS
+        max_tokens = call.max_tokens or _max_tokens
         call_key = f"{call.call_type}:{call.call_detail}" if call.call_detail else call.call_type
         return await _dispatch(messages, int_id, call_key, max_tokens)
 
@@ -302,6 +305,10 @@ class SimResetRequest(BaseModel):
     scheduler: str | None = None
 
 
+class SimConfigUpdateRequest(BaseModel):
+    max_tokens: int | None = None
+
+
 @app.get("/sim/config", tags=["simulation"])
 async def sim_config():
     """Return current server configuration (simulation endpoint)."""
@@ -309,10 +316,24 @@ async def sim_config():
         "scheduler": _active_scheduler_name,
         "rpm": RPM,
         "tpm": TPM,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": _max_tokens,
         "cost_limit": COST_LIMIT,
         "model": MODEL,
     }
+
+
+@app.patch("/sim/config", tags=["simulation"])
+async def sim_config_update(req: SimConfigUpdateRequest):
+    """Update server configuration (simulation endpoint).
+
+    Only provided fields are updated.  Supported: max_tokens.
+    """
+    global _max_tokens
+    if req.max_tokens is not None:
+        if req.max_tokens < 1:
+            raise HTTPException(status_code=422, detail="max_tokens must be >= 1")
+        _max_tokens = req.max_tokens
+    return {"max_tokens": _max_tokens}
 
 
 @app.get("/sim/stats", tags=["simulation"])
