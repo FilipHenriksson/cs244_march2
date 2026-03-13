@@ -106,6 +106,7 @@ async def run_session(session_id: int, prompt: str, stagger_delay: float,
             messages.append({"role": "user", "content": prompt})
             resp = await client.post(base, json={
                 "call_type": "orchestrator",
+                "call_detail": "plan",
                 "messages": list(messages),
             })
             resp.raise_for_status()
@@ -132,6 +133,7 @@ async def run_session(session_id: int, prompt: str, stagger_delay: float,
             # Step 3: Orchestrator synthesizes
             resp = await client.post(base, json={
                 "call_type": "orchestrator",
+                "call_detail": "synthesize",
                 "messages": list(messages),
             })
             resp.raise_for_status()
@@ -158,6 +160,7 @@ async def run_session(session_id: int, prompt: str, stagger_delay: float,
             # Step 5: Final synthesis
             resp = await client.post(base, json={
                 "call_type": "orchestrator",
+                "call_detail": "final",
                 "messages": list(messages),
             })
             resp.raise_for_status()

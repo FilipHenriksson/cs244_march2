@@ -73,6 +73,7 @@ async def run_session(client: httpx.AsyncClient, prompt: str,
     messages.append({"role": "user", "content": prompt})
     resp = await client.post(base, json={
         "call_type": "orchestrator",
+        "call_detail": "plan",
         "messages": list(messages),
     })
     resp.raise_for_status()
@@ -105,6 +106,7 @@ async def run_session(client: httpx.AsyncClient, prompt: str,
     # Step 3: Orchestrator drafts synthesis
     resp = await client.post(base, json={
         "call_type": "orchestrator",
+        "call_detail": "synthesize",
         "messages": list(messages),
     })
     resp.raise_for_status()
@@ -137,6 +139,7 @@ async def run_session(client: httpx.AsyncClient, prompt: str,
     # Step 5: Orchestrator final synthesis
     resp = await client.post(base, json={
         "call_type": "orchestrator",
+        "call_detail": "final",
         "messages": list(messages),
     })
     resp.raise_for_status()

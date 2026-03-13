@@ -103,7 +103,6 @@ def _estimate_tokens(messages: list[dict], call_key: str,
 # Core dispatch: submit one LLM call through the scheduler
 # ---------------------------------------------------------------------------
 
-
 async def _dispatch(messages: list[dict], session_int_id: int,
                     call_key: str, max_tokens: int) -> dict:
     """Build a coro_factory, submit to the scheduler, return parsed result."""
@@ -180,6 +179,7 @@ class CompletionRequest(BaseModel):
     call_type: str
     messages: list[dict]
     max_tokens: int | None = None
+    call_detail: str | None = None
 
 
 class CompletionResponse(BaseModel):
@@ -256,7 +256,8 @@ async def submit_completion(session_id: str, req: CompletionRequest):
     int_id = _resolve_session(session_id)
     messages = _build_messages(req.call_type, req.messages)
     max_tokens = req.max_tokens or MAX_TOKENS
-    result = await _dispatch(messages, int_id, req.call_type, max_tokens)
+    call_key = f"{req.call_type}:{req.call_detail}" if req.call_detail else req.call_type
+    result = await _dispatch(messages, int_id, call_key, max_tokens)
     return CompletionResponse(**result)
 
 
@@ -271,7 +272,8 @@ async def submit_batch(session_id: str, req: BatchCompletionRequest):
     async def _one(call: CompletionRequest) -> dict:
         messages = _build_messages(call.call_type, call.messages)
         max_tokens = call.max_tokens or MAX_TOKENS
-        return await _dispatch(messages, int_id, call.call_type, max_tokens)
+        call_key = f"{call.call_type}:{call.call_detail}" if call.call_detail else call.call_type
+        return await _dispatch(messages, int_id, call_key, max_tokens)
 
     results = await asyncio.gather(*[_one(c) for c in req.calls])
     return BatchCompletionResponse(
