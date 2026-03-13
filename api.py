@@ -1,26 +1,36 @@
-"""FastAPI application exposing the research agent over HTTP.
+"""LLM scheduling proxy — thin server for multi-client workloads.
 
 Endpoints
 ---------
-POST /sessions/start          – create a new session, returns session_id
-POST /sessions/{id}/run_agent – run the research agent for a session
-DELETE /sessions/{id}         – delete a session
+POST   /call_types                          – register a reusable (name, system_prompt) pair
+POST   /sessions                            – create a session, returns session_id
+POST   /sessions/{id}/completions           – submit one LLM call through the scheduler
+POST   /sessions/{id}/completions/batch     – fan-out multiple LLM calls concurrently
+DELETE /sessions/{id}                       – tear down a session
 
-The scheduler, rate limiter, and cost tracker are created at startup via the
-FastAPI lifespan and wired into llm.py via set_scheduler().
+The server owns scheduling, rate limiting, and system-prompt caching.
+Clients drive their own agent loops and conversation state.
 
-The /run_agent endpoint delegates directly to agent.run_agent(), which supports
-two modes:
-  "default" — LLM freely picks which analyst/reviewer tools to call.
-  "strict"  — deterministic 5-analyst + 3-reviewer pipeline (11 LLM calls).
+Configuration (environment variables)
+--------------------------------------
+SCHEDULER       – scheduler name (default: "fifo")
+RPM             – requests per minute (default: 30)
+TPM             – tokens per minute (default: 200000)
+MAX_TOKENS      – per-completion output cap (default: 2048)
+COST_LIMIT      – hard dollar budget (default: 20.0)
+MODEL           – OpenAI model identifier (default: "gpt-4.1-nano")
 """
 
+import asyncio
+import json
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from dotenv import load_dotenv
@@ -28,66 +38,176 @@ load_dotenv()
 
 from sim import RateLimiter, init_cost_tracker
 from schedulers import get_scheduler
-from llm import set_scheduler
-from agent import run_agent
+import sim.cost_tracker as ct
 
 # ---------------------------------------------------------------------------
-# In-memory session registry
+# Configuration from environment
 # ---------------------------------------------------------------------------
 
-# Maps UUID string -> {"created_at": str, "int_id": int}
-sessions: dict[str, dict] = {}
-_next_session_int_id = 0
+SCHEDULER_NAME = os.getenv("SCHEDULER", "fifo")
+RPM = int(os.getenv("RPM", "30"))
+TPM = int(os.getenv("TPM", "200000"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2048"))
+COST_LIMIT = float(os.getenv("COST_LIMIT", "20.0"))
+MODEL = os.getenv("MODEL", "gpt-4.1-nano")
+
+# ---------------------------------------------------------------------------
+# OpenAI client (shared across all requests)
+# ---------------------------------------------------------------------------
+
+_openai = AsyncOpenAI()
+
+# ---------------------------------------------------------------------------
+# Call-type registry: name -> system_prompt
+# ---------------------------------------------------------------------------
+
+_call_types: dict[str, str] = {}
+_call_types_lock = asyncio.Lock()
+
+# ---------------------------------------------------------------------------
+# Session registry: UUID -> {"created_at": str, "int_id": int}
+# ---------------------------------------------------------------------------
+
+_sessions: dict[str, dict] = {}
+_next_int_id = 0
+
+# ---------------------------------------------------------------------------
+# Server-wide scheduler (set during lifespan)
+# ---------------------------------------------------------------------------
+
+_scheduler = None
+
+# ---------------------------------------------------------------------------
+# Token estimation (mirrors llm.py logic)
+# ---------------------------------------------------------------------------
 
 
-def _alloc_session() -> tuple[str, int]:
-    """Create a new session and return (uuid_str, int_id)."""
-    global _next_session_int_id
-    sid = str(uuid.uuid4())
-    int_id = _next_session_int_id
-    _next_session_int_id += 1
-    sessions[sid] = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "int_id": int_id,
+def _estimate_tokens(messages: list[dict], call_key: str,
+                     max_tokens: int) -> int:
+    if _scheduler is not None and hasattr(_scheduler, "estimate_total_tokens"):
+        return _scheduler.estimate_total_tokens(
+            messages, call_key, max_tokens=max_tokens)
+    text = json.dumps(messages, default=str)
+    return len(text) // 4
+
+
+# ---------------------------------------------------------------------------
+# Core dispatch: submit one LLM call through the scheduler
+# ---------------------------------------------------------------------------
+
+
+async def _dispatch(messages: list[dict], session_int_id: int,
+                    call_key: str, max_tokens: int) -> dict:
+    """Build a coro_factory, submit to the scheduler, return parsed result."""
+    est_tokens = _estimate_tokens(messages, call_key, max_tokens)
+
+    if ct.cost_tracker is not None:
+        await ct.cost_tracker.check()
+
+    def coro_factory():
+        return _openai.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+
+    response = await _scheduler.submit(
+        coro_factory, est_tokens, session_int_id, call_key,
+        label=call_key,
+    )
+
+    usage = None
+    if response.usage is not None:
+        usage = {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens,
+        }
+        if ct.cost_tracker is not None:
+            await ct.cost_tracker.record(
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+            )
+
+    return {
+        "content": response.choices[0].message.content,
+        "usage": usage,
     }
-    return sid, int_id
 
 
 # ---------------------------------------------------------------------------
-# Lifespan: start scheduler once, stop on shutdown
+# Lifespan
 # ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    limiter = RateLimiter(rpm=20, tpm=100_000)
-    scheduler = get_scheduler("fifo", limiter)
-    set_scheduler(scheduler)
-    scheduler.start()
-    init_cost_tracker(15.0)
+    global _scheduler
+    limiter = RateLimiter(rpm=RPM, tpm=TPM)
+    _scheduler = get_scheduler(SCHEDULER_NAME, limiter)
+    _scheduler.start()
+    init_cost_tracker(COST_LIMIT)
     yield
-    await scheduler.stop()
+    await _scheduler.stop()
 
 
-app = FastAPI(title="CS244c LLM Scheduler API", lifespan=lifespan)
+app = FastAPI(title="CS244 LLM Scheduling Proxy", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
 
 
-class SessionStartResponse(BaseModel):
+class RegisterCallTypeRequest(BaseModel):
+    name: str
+    system_prompt: str
+
+
+class SessionResponse(BaseModel):
     session_id: str
 
 
-class RunAgentRequest(BaseModel):
-    prompt: str
-    prompt_mode: str = "default"  # "default" or "strict"
+class CompletionRequest(BaseModel):
+    call_type: str
+    messages: list[dict]
+    max_tokens: int | None = None
 
 
-class RunAgentResponse(BaseModel):
-    response: str
-    llm_calls: int
-    tool_calls: int
+class CompletionResponse(BaseModel):
+    content: str
+    usage: dict | None = None
+
+
+class BatchCompletionRequest(BaseModel):
+    calls: list[CompletionRequest]
+
+
+class BatchCompletionResponse(BaseModel):
+    completions: list[CompletionResponse]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_session(session_id: str) -> int:
+    """Return the int_id for a session UUID, or raise 404."""
+    meta = _sessions.get(session_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return meta["int_id"]
+
+
+def _build_messages(call_type: str, user_messages: list[dict]) -> list[dict]:
+    """Prepend the registered system prompt to the caller-supplied messages."""
+    system_prompt = _call_types.get(call_type)
+    if system_prompt is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown call_type: {call_type!r}. Register it first via POST /call_types.",
+        )
+    return [{"role": "system", "content": system_prompt}] + user_messages
 
 
 # ---------------------------------------------------------------------------
@@ -95,39 +215,64 @@ class RunAgentResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@app.post("/sessions/start", response_model=SessionStartResponse)
-async def start_session():
-    sid, _ = _alloc_session()
-    return SessionStartResponse(session_id=sid)
+@app.post("/call_types", status_code=201)
+async def register_call_type(req: RegisterCallTypeRequest):
+    async with _call_types_lock:
+        exists = req.name in _call_types
+        _call_types[req.name] = req.system_prompt
+    status = "updated" if exists else "created"
+    return {"name": req.name, "status": status}
 
 
-@app.post("/sessions/{session_id}/run_agent", response_model=RunAgentResponse)
-async def run_agent_endpoint(session_id: str, req: RunAgentRequest):
-    if session_id not in sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+@app.get("/call_types")
+async def list_call_types():
+    return {"call_types": list(_call_types.keys())}
 
-    if req.prompt_mode not in ("default", "strict"):
-        raise HTTPException(
-            status_code=422,
-            detail="prompt_mode must be 'default' or 'strict'",
-        )
 
-    int_id = sessions[session_id]["int_id"]
-    result = await run_agent(
-        prompt=req.prompt,
-        session_id=int_id,
-        prompt_mode=req.prompt_mode,
-    )
-    return RunAgentResponse(
-        response=result.text,
-        llm_calls=result.llm_calls,
-        tool_calls=result.tool_calls,
+@app.post("/sessions", response_model=SessionResponse)
+async def create_session():
+    global _next_int_id
+    sid = str(uuid.uuid4())
+    int_id = _next_int_id
+    _next_int_id += 1
+    _sessions[sid] = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "int_id": int_id,
+    }
+    return SessionResponse(session_id=sid)
+
+
+@app.post("/sessions/{session_id}/completions", response_model=CompletionResponse)
+async def submit_completion(session_id: str, req: CompletionRequest):
+    int_id = _resolve_session(session_id)
+    messages = _build_messages(req.call_type, req.messages)
+    max_tokens = req.max_tokens or MAX_TOKENS
+    result = await _dispatch(messages, int_id, req.call_type, max_tokens)
+    return CompletionResponse(**result)
+
+
+@app.post("/sessions/{session_id}/completions/batch",
+          response_model=BatchCompletionResponse)
+async def submit_batch(session_id: str, req: BatchCompletionRequest):
+    if not req.calls:
+        return BatchCompletionResponse(completions=[])
+
+    int_id = _resolve_session(session_id)
+
+    async def _one(call: CompletionRequest) -> dict:
+        messages = _build_messages(call.call_type, call.messages)
+        max_tokens = call.max_tokens or MAX_TOKENS
+        return await _dispatch(messages, int_id, call.call_type, max_tokens)
+
+    results = await asyncio.gather(*[_one(c) for c in req.calls])
+    return BatchCompletionResponse(
+        completions=[CompletionResponse(**r) for r in results],
     )
 
 
 @app.delete("/sessions/{session_id}", status_code=204)
 async def delete_session(session_id: str):
-    if session_id not in sessions:
+    if session_id not in _sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    del sessions[session_id]
+    del _sessions[session_id]
     return Response(status_code=204)
