@@ -39,6 +39,7 @@ MODEL           – OpenAI model identifier (default: "gpt-4.1-nano")
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -46,8 +47,10 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError, APIError
 from pydantic import BaseModel
+
+logger = logging.getLogger("api")
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -118,25 +121,63 @@ def _estimate_tokens(messages: list[dict], call_key: str,
 # Core dispatch: submit one LLM call through the scheduler
 # ---------------------------------------------------------------------------
 
+_DISPATCH_MAX_RETRIES = 3
+_DISPATCH_RETRY_BACKOFF = 2.0
+
+
 async def _dispatch(messages: list[dict], session_int_id: int,
                     call_key: str, max_tokens: int) -> dict:
-    """Build a coro_factory, submit to the scheduler, return parsed result."""
+    """Build a coro_factory, submit to the scheduler, return parsed result.
+
+    Retries on transient OpenAI errors (JSON-parse 400s, 5xx) with
+    exponential backoff.
+    """
     est_tokens = _estimate_tokens(messages, call_key, max_tokens)
 
     if ct.cost_tracker is not None:
         await ct.cost_tracker.check()
 
-    def coro_factory():
-        return _openai.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
-        )
+    last_exc: Exception | None = None
+    for attempt in range(_DISPATCH_MAX_RETRIES):
+        try:
+            def coro_factory():
+                return _openai.chat.completions.create(
+                    model=MODEL,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                )
 
-    response = await _scheduler.submit(
-        coro_factory, est_tokens, session_int_id, call_key,
-        label=call_key,
-    )
+            response = await _scheduler.submit(
+                coro_factory, est_tokens, session_int_id, call_key,
+                label=call_key,
+            )
+            break
+        except BadRequestError as exc:
+            last_exc = exc
+            if "could not parse the json body" in str(exc).lower():
+                delay = _DISPATCH_RETRY_BACKOFF * (2 ** attempt)
+                logger.warning(
+                    "Transient OpenAI JSON-parse error on %s (attempt %d/%d), "
+                    "retrying in %.1fs: %s",
+                    call_key, attempt + 1, _DISPATCH_MAX_RETRIES, delay, exc,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+        except APIError as exc:
+            last_exc = exc
+            if exc.status_code and exc.status_code >= 500:
+                delay = _DISPATCH_RETRY_BACKOFF * (2 ** attempt)
+                logger.warning(
+                    "OpenAI %d error on %s (attempt %d/%d), retrying in %.1fs",
+                    exc.status_code, call_key,
+                    attempt + 1, _DISPATCH_MAX_RETRIES, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+    else:
+        raise last_exc  # type: ignore[misc]
 
     usage = None
     if response.usage is not None:
@@ -283,6 +324,23 @@ async def submit_completion(session_id: str, req: CompletionRequest):
 @app.post("/sessions/{session_id}/completions/batch",
           response_model=BatchCompletionResponse)
 async def submit_batch(session_id: str, req: BatchCompletionRequest):
+    """Fan-out multiple LLM calls concurrently within a single session.
+
+    Error handling
+    --------------
+    Each sub-call is dispatched through ``_dispatch``, which already retries
+    transient OpenAI errors (JSON-parse 400s, 5xx) up to
+    ``_DISPATCH_MAX_RETRIES`` times with exponential backoff.
+
+    ``asyncio.gather`` is called with ``return_exceptions=True`` so that a
+    failure in one sub-call does not cancel or abort the others — all sub-calls
+    run to completion independently.  After gathering:
+
+    * If every sub-call succeeded, the full batch of completions is returned.
+    * If any sub-call still failed after its retries were exhausted, the
+      endpoint returns **502** with a detail string listing how many sub-calls
+      failed out of the total (all-or-nothing: partial successes are discarded).
+    """
     if not req.calls:
         return BatchCompletionResponse(completions=[])
 
@@ -294,7 +352,20 @@ async def submit_batch(session_id: str, req: BatchCompletionRequest):
         call_key = f"{call.call_type}:{call.call_detail}" if call.call_detail else call.call_type
         return await _dispatch(messages, int_id, call_key, max_tokens)
 
-    results = await asyncio.gather(*[_one(c) for c in req.calls])
+    results = await asyncio.gather(*[_one(c) for c in req.calls],
+                                   return_exceptions=True)
+
+    first_exc = next((r for r in results if isinstance(r, Exception)), None)
+    if first_exc is not None:
+        failed = [(i, r) for i, r in enumerate(results) if isinstance(r, Exception)]
+        for i, exc in failed:
+            logger.error("Batch sub-call %d (%s) failed: %s",
+                         i, req.calls[i].call_type, exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"{len(failed)}/{len(req.calls)} batch sub-calls failed: {first_exc}",
+        )
+
     return BatchCompletionResponse(
         completions=[CompletionResponse(**r) for r in results],
     )
