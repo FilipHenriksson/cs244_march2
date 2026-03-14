@@ -43,7 +43,7 @@ Each tool is a single LLM call with a specialized system prompt. Tools are desig
 - `review_citations` — thorough check of every factual claim's sourcing
 - `review_facts` — rigorous evaluation of every claim with verdicts and confidence
 
-### Batch Runner
+### Batch Runner (in-process)
 
 `python -m sim.runner` orchestrates multi-scheduler comparison runs:
 
@@ -53,6 +53,20 @@ Each tool is a single LLM call with a specialized system prompt. Tools are desig
    - `bursty` — bursts of 2-5 sessions with 15-35s gaps between bursts, simulating traffic spikes
 3. **Per-scheduler run** — resets rate limiter and trace, launches all sessions with staggered arrivals, collects results.
 4. **Comparison** — prints side-by-side table of metrics across all schedulers.
+
+### API Runner (over HTTP)
+
+`python -m sim.api_runner` drives the same workloads through the scheduling proxy (api.py) over HTTP. Use this when benchmarking the deployed API or testing with multiple independent clients. Each session runs as its own HTTP client, modeled as a separate machine.
+
+**Setup**: Start the API server in one terminal, run the benchmark in another. Requires `PROXY_API_KEY` in `.env` for auth.
+
+```bash
+# Terminal 1: start the proxy
+uvicorn api:app --host 0.0.0.0 --port 8000
+
+# Terminal 2: run the benchmark
+python -m sim.api_runner --sessions 30 --schedulers fifo mapreduce mapreduce_skip_adaptive --max-tokens 2048
+```
 
 ## Rate Limiter
 
@@ -166,6 +180,7 @@ Create a `.env` file:
 
 ```
 OPENAI_API_KEY=sk-...
+PROXY_API_KEY=...   # Required for api.py and sim.api_runner
 ```
 
 ### Install
@@ -200,6 +215,17 @@ python -m sim.runner --scheduler fifo --sessions 15 --stagger-mode bursty
 python -m sim.runner --all-schedulers --sessions 30 --output-dir results/
 ```
 
+### API-based batch comparison
+
+```bash
+# Terminal 1: start the API server
+uvicorn api:app --host 0.0.0.0 --port 8000
+
+# Terminal 2: run api_runner (same CLI as sim.runner)
+python -m sim.api_runner --all-schedulers --sessions 15 --seed 42
+python -m sim.api_runner --schedulers fifo mapreduce --sessions 10 --base-url http://localhost:8000
+```
+
 ### CLI options
 
 | Flag | Default | Description |
@@ -222,6 +248,7 @@ python -m sim.runner --all-schedulers --sessions 30 --output-dir results/
 
 ```
 main.py                      Single-session entry point
+client_example.py            Example API client — strict pipeline over HTTP
 agent.py                     Research agent — strict pipeline (11 LLM calls)
 llm.py                       LLM call dispatcher (routes through scheduler)
 tools/
@@ -239,6 +266,7 @@ schedulers/
   deprecated/                Explored and deprecated schedulers (see above)
 sim/
   runner.py                  Batch experiment runner (python -m sim.runner)
+  api_runner.py              API-based benchmark (python -m sim.api_runner)
   workload.py                Workload generation (arrivals + prompt assignment)
   rate_limiter.py            Token-bucket rate limiter (RPM + TPM)
   cost_tracker.py            Budget tracking and kill switch
