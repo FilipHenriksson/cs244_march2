@@ -184,6 +184,10 @@ async def run_session(session_id: int, prompt: str, stagger_delay: float,
         except Exception as e:
             elapsed = time.time() - start
             print(f"  [session={session_id}] ERROR after {elapsed:.1f}s: {e}")
+            try:
+                await client.delete(f"/sessions/{sid}")
+            except Exception:
+                pass
             return SessionResult(session_id, prompt, elapsed,
                                  success=False, error=str(e))
 
@@ -201,8 +205,8 @@ def compute_latency_stats(results: list[SessionResult]) -> dict:
         "count": len(durations),
         "mean": statistics.mean(durations),
         "median": statistics.median(durations),
-        "p95": durations[int(len(durations) * 0.95)],
-        "p99": durations[int(len(durations) * 0.99)] if len(durations) > 1 else durations[-1],
+        "p95": durations[max(0, int(len(durations) * 0.95) - 1)],
+        "p99": durations[max(0, int(len(durations) * 0.99) - 1)],
         "min": min(durations),
         "max": max(durations),
         "stdev": statistics.stdev(durations) if len(durations) > 1 else 0.0,
