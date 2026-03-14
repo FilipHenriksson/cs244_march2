@@ -87,7 +87,7 @@ _max_tokens = int(os.getenv("MAX_TOKENS", "2048"))
 # OpenAI client (shared across all requests)
 # ---------------------------------------------------------------------------
 
-_openai = AsyncOpenAI()
+_openai = AsyncOpenAI(timeout=1200)
 
 # ---------------------------------------------------------------------------
 # Call-type registry: name -> system_prompt
