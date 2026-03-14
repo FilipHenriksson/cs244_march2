@@ -42,7 +42,7 @@ def estimate_tokens(messages, **kwargs) -> int:
     text = json.dumps(messages, default=str)
     if "tools" in kwargs:
         text += json.dumps(kwargs["tools"], default=str)
-    return len(text) // 4
+    return len(text) // 4 + kwargs.get("max_tokens", _max_tokens)
 
 
 async def llm_call(messages, session_id: int, call_key: str,
