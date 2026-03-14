@@ -23,6 +23,7 @@ def compute_arrival_times(n: int, stagger: float, mode: str,
         simultaneously (within *stagger* seconds of each other), separated
         by quiet gaps (3-6x the burst duration).  Scales naturally with
         session count: 200 sessions → ~8-12 bursts of 15-30 each.
+        All arrivals are rescaled to fit within *n * stagger* seconds.
     """
     if mode == "constant":
         return [i * stagger for i in range(n)]
@@ -42,6 +43,11 @@ def compute_arrival_times(n: int, stagger: float, mode: str,
             if remaining > 0:
                 burst_dur = burst_size * stagger
                 t += r.uniform(burst_dur * 3, burst_dur * 6)
+        window = n * stagger
+        max_t = times[-1] if times else 0.0
+        if max_t > window and max_t > 0:
+            scale = window / max_t
+            times = [t * scale for t in times]
         return times
     else:
         raise ValueError(f"Unknown sim type: {mode}")

@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
-from openai import AsyncOpenAI, BadRequestError, RateLimitError, APIError
+from openai import AsyncOpenAI, APIConnectionError, BadRequestError, RateLimitError, APIError
 from pydantic import BaseModel
 
 logging.basicConfig(
@@ -192,19 +192,30 @@ async def _dispatch(messages: list[dict], session_int_id: int,
             )
             await asyncio.sleep(delay)
             continue
+        except APIConnectionError as exc:
+            last_exc = exc
+            delay = _DISPATCH_RETRY_BACKOFF * (2 ** attempt)
+            logger.warning(
+                "OpenAI connection error on %s (attempt %d/%d), "
+                "retrying in %.1fs: %s",
+                call_key, attempt + 1, _DISPATCH_MAX_RETRIES, delay, exc,
+            )
+            await asyncio.sleep(delay)
+            continue
         except APIError as exc:
             last_exc = exc
-            if exc.status_code and exc.status_code >= 500:
+            status = getattr(exc, "status_code", None)
+            if status is not None and status >= 500:
                 delay = _DISPATCH_RETRY_BACKOFF * (2 ** attempt)
                 logger.warning(
                     "OpenAI %d error on %s (attempt %d/%d), retrying in %.1fs",
-                    exc.status_code, call_key,
+                    status, call_key,
                     attempt + 1, _DISPATCH_MAX_RETRIES, delay,
                 )
                 await asyncio.sleep(delay)
                 continue
             logger.error("OpenAI APIError on %s (status=%s): %s",
-                         call_key, exc.status_code, exc)
+                         call_key, status, exc)
             raise
     else:
         logger.error("OpenAI error on %s: retries exhausted (%d/%d): %s",

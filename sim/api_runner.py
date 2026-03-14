@@ -412,7 +412,7 @@ def _parse_args():
                         help="Run all schedulers sequentially and compare")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--base-url", type=str, default="http://localhost:8000")
-    parser.add_argument("--timeout", type=float, default=600.0,
+    parser.add_argument("--timeout", type=float, default=1200.0,
                         help="HTTP request timeout in seconds (default: 600)")
     parser.add_argument("--cooldown", type=float, default=5.0,
                         help="Seconds to sleep between scheduler runs (default: 5)")
