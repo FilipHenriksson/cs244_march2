@@ -56,7 +56,7 @@ Each tool is a single LLM call with a specialized system prompt. Tools are desig
 
 ### API Runner (over HTTP)
 
-`python -m sim.api_runner` drives the same workloads through the scheduling proxy (api.py) over HTTP. Use this when benchmarking the deployed API or testing with multiple independent clients. Each session runs as its own HTTP client, modeled as a separate machine.
+`python -m sim.api_runner` drives the **strict** through the scheduling proxy (api.py) over HTTP. Each session runs as its own HTTP client, modeled as a separate machine.
 
 **Setup**: Start the API server in one terminal, run the benchmark in another. Requires `PROXY_API_KEY` in `.env` for auth.
 
@@ -248,7 +248,7 @@ python -m sim.api_runner --schedulers fifo mapreduce --sessions 10 --base-url ht
 
 ```
 main.py                      Single-session entry point
-client_example.py            Example API client — strict pipeline over HTTP
+api_example.py               Example API client — strict pipeline over HTTP
 agent.py                     Research agent — strict pipeline (11 LLM calls)
 llm.py                       LLM call dispatcher (routes through scheduler)
 tools/
