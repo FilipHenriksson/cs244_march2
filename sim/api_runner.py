@@ -418,6 +418,10 @@ def _parse_args():
                         help="Seconds to sleep between scheduler runs (default: 5)")
     parser.add_argument("--max-tokens", type=int, default=1024,
                         help="Max tokens per completion; sets API server value once (default: 1024)")
+    parser.add_argument("--rpm", type=int, default=None,
+                        help="Requests per minute (updates API server rate limiter)")
+    parser.add_argument("--tpm", type=int, default=None,
+                        help="Tokens per minute (updates API server rate limiter)")
     return parser.parse_args()
 
 
@@ -434,12 +438,17 @@ async def main():
     workload = generate_workload(args.sessions, args.stagger,
                                  args.stagger_mode, args.seed)
 
-    # Set max_tokens and fetch server config
+    # Set max_tokens / rpm / tpm and fetch server config
+    config_update: dict = {"max_tokens": args.max_tokens}
+    if args.rpm is not None:
+        config_update["rpm"] = args.rpm
+    if args.tpm is not None:
+        config_update["tpm"] = args.tpm
     async with httpx.AsyncClient(
         base_url=args.base_url, timeout=httpx.Timeout(args.timeout), http2=True,
         headers=AUTH_HEADERS,
     ) as client:
-        resp = await client.patch("/sim/config", json={"max_tokens": args.max_tokens})
+        resp = await client.patch("/sim/config", json=config_update)
         resp.raise_for_status()
         resp = await client.get("/sim/config")
         resp.raise_for_status()

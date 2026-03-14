@@ -13,7 +13,7 @@ Simulation / benchmarking endpoints (not for production use)
 GET    /sim/stats                           – server-side metrics snapshot
 POST   /sim/reset                           – reset state for a fresh benchmark run
 GET    /sim/config                          – current server configuration
-PATCH  /sim/config                          – update config (e.g. max_tokens)
+PATCH  /sim/config                          – update config (max_tokens, rpm, tpm)
 
 The server owns scheduling, rate limiting, and system-prompt caching.
 Clients drive their own agent loops and conversation state.
@@ -30,8 +30,8 @@ Configuration (environment variables)
 --------------------------------------
 PROXY_API_KEY   – required auth token (no default; must be set)
 SCHEDULER       – scheduler name (default: "fifo")
-RPM             – requests per minute (default: 30)
-TPM             – tokens per minute (default: 200000)
+RPM             – initial requests per minute (default: 30; updatable via PATCH /sim/config)
+TPM             – initial tokens per minute (default: 200000; updatable via PATCH /sim/config)
 MAX_TOKENS      – per-completion output cap (default: 2048)
 COST_LIMIT      – hard dollar budget (default: 20.0)
 MODEL           – OpenAI model identifier (default: "gpt-4.1-nano")
@@ -70,10 +70,12 @@ import sim.cost_tracker as ct
 # ---------------------------------------------------------------------------
 
 SCHEDULER_NAME = os.getenv("SCHEDULER", "fifo")
-RPM = int(os.getenv("RPM", "30"))
-TPM = int(os.getenv("TPM", "200000"))
 COST_LIMIT = float(os.getenv("COST_LIMIT", "20.0"))
 MODEL = os.getenv("MODEL", "gpt-4.1-nano")
+
+# Mutable rate-limit settings (defaults from env; can be updated via PATCH /sim/config)
+_rpm = int(os.getenv("RPM", "30"))
+_tpm = int(os.getenv("TPM", "200000"))
 API_KEY = os.getenv("PROXY_API_KEY")
 if not API_KEY:
     raise RuntimeError("PROXY_API_KEY environment variable is required")
@@ -229,11 +231,10 @@ async def _dispatch(messages: list[dict], session_int_id: int,
     }
 
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler, _limiter, _active_scheduler_name
-    _limiter = RateLimiter(rpm=RPM, tpm=TPM)
+    _limiter = RateLimiter(rpm=_rpm, tpm=_tpm)
     _active_scheduler_name = SCHEDULER_NAME
     _scheduler = get_scheduler(_active_scheduler_name, _limiter)
     _scheduler.start()
@@ -425,6 +426,8 @@ class SimResetRequest(BaseModel):
 
 class SimConfigUpdateRequest(BaseModel):
     max_tokens: int | None = None
+    rpm: int | None = None
+    tpm: int | None = None
 
 
 @app.get("/sim/config", tags=["simulation"])
@@ -432,8 +435,8 @@ async def sim_config():
     """Return current server configuration (simulation endpoint)."""
     return {
         "scheduler": _active_scheduler_name,
-        "rpm": RPM,
-        "tpm": TPM,
+        "rpm": _rpm,
+        "tpm": _tpm,
         "max_tokens": _max_tokens,
         "cost_limit": COST_LIMIT,
         "model": MODEL,
@@ -444,14 +447,37 @@ async def sim_config():
 async def sim_config_update(req: SimConfigUpdateRequest):
     """Update server configuration (simulation endpoint).
 
-    Only provided fields are updated.  Supported: max_tokens.
+    Only provided fields are updated.  Supported: max_tokens, rpm, tpm.
+    When rpm or tpm change the rate limiter and scheduler are re-created so
+    the new limits take effect immediately.
     """
-    global _max_tokens
+    global _max_tokens, _rpm, _tpm, _limiter, _scheduler
     if req.max_tokens is not None:
         if req.max_tokens < 1:
             raise HTTPException(status_code=422, detail="max_tokens must be >= 1")
         _max_tokens = req.max_tokens
-    return {"max_tokens": _max_tokens}
+
+    rebuild_limiter = False
+    if req.rpm is not None:
+        if req.rpm < 1:
+            raise HTTPException(status_code=422, detail="rpm must be >= 1")
+        _rpm = req.rpm
+        rebuild_limiter = True
+    if req.tpm is not None:
+        if req.tpm < 1:
+            raise HTTPException(status_code=422, detail="tpm must be >= 1")
+        _tpm = req.tpm
+        rebuild_limiter = True
+
+    if rebuild_limiter and _limiter is not None:
+        if _scheduler is not None:
+            await _scheduler.stop()
+        _limiter = RateLimiter(rpm=_rpm, tpm=_tpm)
+        _scheduler = get_scheduler(_active_scheduler_name, _limiter)
+        _scheduler.start()
+        logger.info("Rate limiter re-created: rpm=%d tpm=%d", _rpm, _tpm)
+
+    return {"max_tokens": _max_tokens, "rpm": _rpm, "tpm": _tpm}
 
 
 @app.get("/sim/stats", tags=["simulation"])
@@ -498,7 +524,7 @@ async def sim_reset(req: SimResetRequest | None = None):
     if _scheduler is not None:
         await _scheduler.stop()
 
-    _limiter.reset()
+    _limiter = RateLimiter(rpm=_rpm, tpm=_tpm)
     init_cost_tracker(COST_LIMIT)
     _sessions = {}
     _next_int_id = 0
