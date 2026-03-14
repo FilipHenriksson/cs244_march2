@@ -7,7 +7,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8080
+EXPOSE 443 80
 
-ENV PORT=8080
-CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT}"]
+ENV CERT_DIR=/etc/letsencrypt/live/default
+CMD ["sh", "-c", \
+  "hypercorn api:app \
+    --bind 0.0.0.0:443 \
+    --certfile ${CERT_DIR}/fullchain.pem \
+    --keyfile ${CERT_DIR}/privkey.pem \
+    --insecure-bind 0.0.0.0:80"]
