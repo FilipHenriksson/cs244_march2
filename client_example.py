@@ -17,15 +17,21 @@ Usage::
 
 import argparse
 import asyncio
+import os
 import time
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from prompts.system import ORCHESTRATOR_SYSTEM_PROMPT
 from tools.analysts import _ANALYSTS
 from tools.reviewers import _REVIEWERS
 
 BASE_URL = "http://localhost:8000"
+API_KEY = os.getenv("PROXY_API_KEY", "")
+AUTH_HEADERS = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
 
 STRICT_ANALYSTS = [
     "analyst_web_research", "analyst_summarizer", "analyst_deep_analysis",
@@ -176,6 +182,7 @@ async def main():
         base_url=args.base_url,
         timeout=httpx.Timeout(args.timeout),
         http2=True,
+        headers=AUTH_HEADERS,
     ) as client:
         await register_call_types(client)
 

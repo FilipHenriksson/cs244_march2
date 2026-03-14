@@ -18,8 +18,17 @@ PATCH  /sim/config                          – update config (e.g. max_tokens)
 The server owns scheduling, rate limiting, and system-prompt caching.
 Clients drive their own agent loops and conversation state.
 
+Authentication
+--------------
+All requests require a Bearer token via the ``Authorization`` header.
+Set ``PROXY_API_KEY`` in the environment (or ``.env``); the server refuses
+to start if it is missing.  Clients must send::
+
+    Authorization: Bearer <PROXY_API_KEY>
+
 Configuration (environment variables)
 --------------------------------------
+PROXY_API_KEY   – required auth token (no default; must be set)
 SCHEDULER       – scheduler name (default: "fifo")
 RPM             – requests per minute (default: 30)
 TPM             – tokens per minute (default: 200000)
@@ -35,7 +44,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -56,6 +65,9 @@ RPM = int(os.getenv("RPM", "30"))
 TPM = int(os.getenv("TPM", "200000"))
 COST_LIMIT = float(os.getenv("COST_LIMIT", "20.0"))
 MODEL = os.getenv("MODEL", "gpt-4.1-nano")
+API_KEY = os.getenv("PROXY_API_KEY")
+if not API_KEY:
+    raise RuntimeError("PROXY_API_KEY environment variable is required")
 
 # Mutable max_tokens (default from env; can be updated via PATCH /sim/config)
 _max_tokens = int(os.getenv("MAX_TOKENS", "2048"))
@@ -145,10 +157,6 @@ async def _dispatch(messages: list[dict], session_int_id: int,
     }
 
 
-# ---------------------------------------------------------------------------
-# Lifespan
-# ---------------------------------------------------------------------------
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -163,6 +171,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CS244 LLM Scheduling Proxy", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if request.headers.get("Authorization") != f"Bearer {API_KEY}":
+        return Response(status_code=401, content="Unauthorized")
+    return await call_next(request)
+
 
 # ---------------------------------------------------------------------------
 # Request / response models

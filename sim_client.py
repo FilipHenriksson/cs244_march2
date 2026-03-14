@@ -17,10 +17,14 @@ Usage::
 
 import argparse
 import asyncio
+import os
 import statistics
 import time
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from prompts.system import ORCHESTRATOR_SYSTEM_PROMPT
 from tools.analysts import _ANALYSTS
@@ -49,6 +53,9 @@ N_ANALYSTS = len(STRICT_ANALYSTS)
 N_REVIEWERS = len(STRICT_REVIEWERS)
 LLM_CALLS_PER_SESSION = 3 + N_ANALYSTS + N_REVIEWERS
 
+API_KEY = os.getenv("PROXY_API_KEY", "")
+AUTH_HEADERS = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
 
 # ---------------------------------------------------------------------------
 # Session result
@@ -72,6 +79,7 @@ class SessionResult:
 async def register_call_types(base_url: str, timeout: float):
     async with httpx.AsyncClient(
         base_url=base_url, timeout=httpx.Timeout(timeout), http2=True,
+        headers=AUTH_HEADERS,
     ) as client:
         for name, system_prompt in ALL_CALL_TYPES.items():
             resp = await client.post("/call_types", json={
@@ -94,6 +102,7 @@ async def run_session(session_id: int, prompt: str, stagger_delay: float,
 
     async with httpx.AsyncClient(
         base_url=base_url, timeout=httpx.Timeout(timeout), http2=True,
+        headers=AUTH_HEADERS,
     ) as client:
         try:
             resp = await client.post("/sessions")
@@ -367,6 +376,7 @@ async def run_one_scheduler(scheduler_name: str, workload: dict,
     # Fetch server-side stats
     async with httpx.AsyncClient(
         base_url=base_url, timeout=httpx.Timeout(timeout), http2=True,
+        headers=AUTH_HEADERS,
     ) as client:
         resp = await client.get("/sim/stats")
         resp.raise_for_status()
@@ -423,6 +433,7 @@ async def main():
     # Set max_tokens and fetch server config
     async with httpx.AsyncClient(
         base_url=args.base_url, timeout=httpx.Timeout(args.timeout), http2=True,
+        headers=AUTH_HEADERS,
     ) as client:
         resp = await client.patch("/sim/config", json={"max_tokens": args.max_tokens})
         resp.raise_for_status()
@@ -457,6 +468,7 @@ async def main():
         # Reset server to this scheduler before each run
         async with httpx.AsyncClient(
             base_url=args.base_url, timeout=httpx.Timeout(args.timeout), http2=True,
+            headers=AUTH_HEADERS,
         ) as client:
             resp = await client.post("/sim/reset", json={"scheduler": sched_name})
             resp.raise_for_status()
