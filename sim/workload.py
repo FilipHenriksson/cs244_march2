@@ -19,9 +19,10 @@ def compute_arrival_times(n: int, stagger: float, mode: str,
         a steady, predictable load.
 
     ``bursty``
-        Wave-like clusters — bursts of 2-5 sessions arrive close together
-        (0.5-2s apart), separated by quiet gaps (15-35s).  Simulates
-        real-world traffic spikes.
+        Wave-like clusters — bursts of 5-15% of sessions arrive nearly
+        simultaneously (within *stagger* seconds of each other), separated
+        by quiet gaps (3-6x the burst duration).  Scales naturally with
+        session count: 200 sessions → ~8-12 bursts of 15-30 each.
     """
     if mode == "constant":
         return [i * stagger for i in range(n)]
@@ -30,14 +31,17 @@ def compute_arrival_times(n: int, stagger: float, mode: str,
         times = []
         t = 0.0
         remaining = n
+        lo = max(2, int(n * 0.05))
+        hi = max(lo + 1, int(n * 0.15))
         while remaining > 0:
-            burst_size = min(r.randint(2, 5), remaining)
+            burst_size = min(r.randint(lo, hi), remaining)
             for j in range(burst_size):
                 times.append(t)
-                t += r.uniform(0.5, 2.0)
+                t += r.uniform(stagger * 0.5, stagger * 1.5)
             remaining -= burst_size
             if remaining > 0:
-                t += r.uniform(15.0, 35.0)
+                burst_dur = burst_size * stagger
+                t += r.uniform(burst_dur * 3, burst_dur * 6)
         return times
     else:
         raise ValueError(f"Unknown sim type: {mode}")

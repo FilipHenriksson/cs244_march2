@@ -50,7 +50,7 @@ class RateLimiter:
 
         # Refill rates (units per second)
         self._rpm_rate: float = rpm / 60.0
-        self._tpm_rate: float = tpm / 60.0
+        self._tpm_rate: float = tpm / 60.0 * 0.6
 
         self._last_refill: float = time.time()
         self._lock = asyncio.Lock()
