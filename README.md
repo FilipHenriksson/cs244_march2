@@ -58,11 +58,11 @@ Each tool is a single LLM call with a specialized system prompt. Tools are desig
 
 `python -m sim.api_runner` drives the **strict** through the scheduling proxy (api.py) over HTTP. Each session runs as its own HTTP client, modeled as a separate machine.
 
-**Setup**: Start the API server in one terminal, run the benchmark in another. Requires `PROXY_API_KEY` in `.env` for auth.
+**Setup**: Start the API server in one terminal, run the benchmark in another. Requires `PROXY_API_KEY` in `.env` for auth. 
 
 ```bash
 # Terminal 1: start the proxy
-uvicorn api:app --host 0.0.0.0 --port 8000
+hypercorn api:app --host 0.0.0.0 --port 8000
 
 # Terminal 2: run the benchmark
 python -m sim.api_runner --sessions 30 --schedulers fifo mapreduce mapreduce_skip_adaptive --max-tokens 2048
