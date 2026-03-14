@@ -111,7 +111,7 @@ def _estimate_tokens(messages: list[dict], call_key: str,
         return _scheduler.estimate_total_tokens(
             messages, call_key, max_tokens=max_tokens)
     text = json.dumps(messages, default=str)
-    return len(text) // 4
+    return len(text) // 4 + max_tokens
 
 
 # ---------------------------------------------------------------------------
