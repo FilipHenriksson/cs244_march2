@@ -47,9 +47,15 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
-from openai import AsyncOpenAI, BadRequestError, APIError
+from openai import AsyncOpenAI, BadRequestError, RateLimitError, APIError
 from pydantic import BaseModel
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+for _quiet in ("openai", "httpx", "httpcore"):
+    logging.getLogger(_quiet).setLevel(logging.WARNING)
 logger = logging.getLogger("api")
 
 from dotenv import load_dotenv
@@ -129,8 +135,8 @@ async def _dispatch(messages: list[dict], session_int_id: int,
                     call_key: str, max_tokens: int) -> dict:
     """Build a coro_factory, submit to the scheduler, return parsed result.
 
-    Retries on transient OpenAI errors (JSON-parse 400s, 5xx) with
-    exponential backoff.
+    Retries on transient OpenAI errors (JSON-parse 400s, 429 rate limits,
+    5xx) with exponential backoff.
     """
     est_tokens = _estimate_tokens(messages, call_key, max_tokens)
 
@@ -163,7 +169,27 @@ async def _dispatch(messages: list[dict], session_int_id: int,
                 )
                 await asyncio.sleep(delay)
                 continue
+            logger.error("OpenAI BadRequestError on %s: %s", call_key, exc)
             raise
+        except RateLimitError as exc:
+            last_exc = exc
+            retry_after = None
+            if exc.response is not None:
+                header = exc.response.headers.get("retry-after")
+                if header:
+                    try:
+                        retry_after = float(header)
+                    except (ValueError, TypeError):
+                        pass
+            delay = retry_after or _DISPATCH_RETRY_BACKOFF * (2 ** attempt)
+            logger.warning(
+                "OpenAI 429 rate limit on %s (attempt %d/%d), "
+                "sleeping %.1fs (retry-after=%s)",
+                call_key, attempt + 1, _DISPATCH_MAX_RETRIES,
+                delay, retry_after,
+            )
+            await asyncio.sleep(delay)
+            continue
         except APIError as exc:
             last_exc = exc
             if exc.status_code and exc.status_code >= 500:
@@ -175,8 +201,13 @@ async def _dispatch(messages: list[dict], session_int_id: int,
                 )
                 await asyncio.sleep(delay)
                 continue
+            logger.error("OpenAI APIError on %s (status=%s): %s",
+                         call_key, exc.status_code, exc)
             raise
     else:
+        logger.error("OpenAI error on %s: retries exhausted (%d/%d): %s",
+                     call_key, _DISPATCH_MAX_RETRIES,
+                     _DISPATCH_MAX_RETRIES, last_exc)
         raise last_exc  # type: ignore[misc]
 
     usage = None
