@@ -41,9 +41,12 @@ import asyncio
 import json
 import logging
 import os
+import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
@@ -57,6 +60,79 @@ logging.basicConfig(
 for _quiet in ("openai", "httpx", "httpcore"):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 logger = logging.getLogger("api")
+
+# ---------------------------------------------------------------------------
+# Dedicated logger for OpenAI rate-limit response headers
+# ---------------------------------------------------------------------------
+
+_rl_header_log = logging.getLogger("openai_rl_headers")
+_rl_header_log.setLevel(logging.INFO)
+_rl_header_log.propagate = False
+
+_RESULTS_DIR = Path("results")
+_RESULTS_DIR.mkdir(exist_ok=True)
+_rl_header_fh = logging.FileHandler(_RESULTS_DIR / "openai_headers.log", mode="w")
+_rl_header_fh.setFormatter(logging.Formatter("%(message)s"))
+_rl_header_log.addHandler(_rl_header_fh)
+
+_RL_HEADER_KEYS = (
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+)
+
+_t0: float = 0.0
+
+
+def _parse_reset_time(val: str | None) -> float | None:
+    """Convert OpenAI reset-time strings like '12ms', '6s', '2m30s' to seconds."""
+    if not val:
+        return None
+    total = 0.0
+    for amount, unit in re.findall(r"([0-9.]+)(ms|m|s)", val):
+        amount = float(amount)
+        if unit == "ms":
+            total += amount / 1000
+        elif unit == "s":
+            total += amount
+        elif unit == "m":
+            total += amount * 60
+    return total if total > 0 else None
+
+
+def _log_rl_headers(headers, call_key: str, *, status: str = "ok"):
+    """Extract and log OpenAI rate-limit headers as a single JSON line."""
+    global _t0
+    if _t0 == 0.0:
+        _t0 = time.time()
+    elapsed = time.time() - _t0
+    row = {
+        "t": round(elapsed, 3),
+        "call": call_key,
+        "status": status,
+    }
+    for key in _RL_HEADER_KEYS:
+        val = headers.get(key)
+        if val is not None:
+            short = key.replace("x-ratelimit-", "")
+            if "remaining" in short or "limit" in short:
+                try:
+                    val = int(val)
+                except (ValueError, TypeError):
+                    pass
+            elif "reset" in short:
+                val = _parse_reset_time(val)
+            row[short] = val
+    retry = headers.get("retry-after")
+    if retry is not None:
+        try:
+            row["retry_after"] = float(retry)
+        except (ValueError, TypeError):
+            row["retry_after"] = retry
+    _rl_header_log.info(json.dumps(row))
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -133,6 +209,18 @@ _DISPATCH_MAX_RETRIES = 3
 _DISPATCH_RETRY_BACKOFF = 2.0
 
 
+async def _call_openai_with_headers(messages: list[dict], max_tokens: int,
+                                     call_key: str):
+    """Call OpenAI with ``with_raw_response`` to capture rate-limit headers."""
+    raw = await _openai.chat.completions.with_raw_response.create(
+        model=MODEL,
+        messages=messages,
+        max_tokens=max_tokens,
+    )
+    _log_rl_headers(raw.headers, call_key)
+    return raw.parse()
+
+
 async def _dispatch(messages: list[dict], session_int_id: int,
                     call_key: str, max_tokens: int) -> dict:
     """Build a coro_factory, submit to the scheduler, return parsed result.
@@ -149,11 +237,7 @@ async def _dispatch(messages: list[dict], session_int_id: int,
     for attempt in range(_DISPATCH_MAX_RETRIES):
         try:
             def coro_factory():
-                return _openai.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                )
+                return _call_openai_with_headers(messages, max_tokens, call_key)
 
             response = await _scheduler.submit(
                 coro_factory, est_tokens, session_int_id, call_key,
@@ -162,6 +246,8 @@ async def _dispatch(messages: list[dict], session_int_id: int,
             break
         except BadRequestError as exc:
             last_exc = exc
+            if exc.response is not None:
+                _log_rl_headers(exc.response.headers, call_key, status="bad_request")
             if "could not parse the json body" in str(exc).lower():
                 delay = _DISPATCH_RETRY_BACKOFF * (2 ** attempt)
                 logger.warning(
@@ -177,6 +263,7 @@ async def _dispatch(messages: list[dict], session_int_id: int,
             last_exc = exc
             retry_after = None
             if exc.response is not None:
+                _log_rl_headers(exc.response.headers, call_key, status="429")
                 header = exc.response.headers.get("retry-after")
                 if header:
                     try:
@@ -194,6 +281,8 @@ async def _dispatch(messages: list[dict], session_int_id: int,
             continue
         except APIError as exc:
             last_exc = exc
+            if exc.response is not None:
+                _log_rl_headers(exc.response.headers, call_key, status=f"error_{exc.status_code}")
             if exc.status_code and exc.status_code >= 500:
                 delay = _DISPATCH_RETRY_BACKOFF * (2 ** attempt)
                 logger.warning(
@@ -519,11 +608,12 @@ async def sim_reset(req: SimResetRequest | None = None):
     Stops the current scheduler, resets the rate limiter and cost tracker,
     clears all sessions, and (optionally) switches to a different scheduler.
     """
-    global _scheduler, _limiter, _active_scheduler_name, _sessions, _next_int_id
+    global _scheduler, _limiter, _active_scheduler_name, _sessions, _next_int_id, _t0
 
     if _scheduler is not None:
         await _scheduler.stop()
 
+    _t0 = time.time()
     _limiter = RateLimiter(rpm=_rpm, tpm=_tpm)
     init_cost_tracker(COST_LIMIT)
     _sessions = {}

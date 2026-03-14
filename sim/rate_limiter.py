@@ -91,13 +91,19 @@ class RateLimiter:
             self._refill(time.time())
             if self._rpm_bucket < 1.0:
                 self._rpm_throttles += 1
+                log.info("[ACQUIRE] THROTTLE_RPM est=%d rpm_bucket=%.1f tpm_bucket=%.1f",
+                         estimated_tokens, self._rpm_bucket, self._tpm_bucket)
                 return THROTTLE_RPM
             if self._tpm_bucket < estimated_tokens:
                 self._tpm_throttles += 1
+                log.info("[ACQUIRE] THROTTLE_TPM est=%d rpm_bucket=%.1f tpm_bucket=%.1f",
+                         estimated_tokens, self._rpm_bucket, self._tpm_bucket)
                 return THROTTLE_TPM
             self._rpm_bucket -= 1.0
             self._tpm_bucket -= estimated_tokens
             self._total_acquires += 1
+            log.info("[ACQUIRE] OK est=%d rpm_bucket=%.1f tpm_bucket=%.1f",
+                     estimated_tokens, self._rpm_bucket, self._tpm_bucket)
             return None
 
     async def record_actual_usage(self, prompt_tokens: int, completion_tokens: int,
