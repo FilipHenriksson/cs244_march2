@@ -13,7 +13,7 @@ Simulation / benchmarking endpoints (not for production use)
 GET    /sim/stats                           – server-side metrics snapshot
 POST   /sim/reset                           – reset state for a fresh benchmark run
 GET    /sim/config                          – current server configuration
-PATCH  /sim/config                          – update config (e.g. max_tokens)
+PATCH  /sim/config                          – update config (max_tokens, rpm, tpm)
 
 The server owns scheduling, rate limiting, and system-prompt caching.
 Clients drive their own agent loops and conversation state.
@@ -30,8 +30,8 @@ Configuration (environment variables)
 --------------------------------------
 PROXY_API_KEY   – required auth token (no default; must be set)
 SCHEDULER       – scheduler name (default: "fifo")
-RPM             – requests per minute (default: 30)
-TPM             – tokens per minute (default: 200000)
+RPM             – initial requests per minute (default: 30; updatable via PATCH /sim/config)
+TPM             – initial tokens per minute (default: 200000; updatable via PATCH /sim/config)
 MAX_TOKENS      – per-completion output cap (default: 2048)
 COST_LIMIT      – hard dollar budget (default: 20.0)
 MODEL           – OpenAI model identifier (default: "gpt-4.1-nano")
@@ -39,6 +39,7 @@ MODEL           – OpenAI model identifier (default: "gpt-4.1-nano")
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -46,8 +47,16 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError, RateLimitError, APIError
 from pydantic import BaseModel
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+for _quiet in ("openai", "httpx", "httpcore"):
+    logging.getLogger(_quiet).setLevel(logging.WARNING)
+logger = logging.getLogger("api")
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -61,10 +70,12 @@ import sim.cost_tracker as ct
 # ---------------------------------------------------------------------------
 
 SCHEDULER_NAME = os.getenv("SCHEDULER", "fifo")
-RPM = int(os.getenv("RPM", "30"))
-TPM = int(os.getenv("TPM", "200000"))
 COST_LIMIT = float(os.getenv("COST_LIMIT", "20.0"))
 MODEL = os.getenv("MODEL", "gpt-4.1-nano")
+
+# Mutable rate-limit settings (defaults from env; can be updated via PATCH /sim/config)
+_rpm = int(os.getenv("RPM", "30"))
+_tpm = int(os.getenv("TPM", "200000"))
 API_KEY = os.getenv("PROXY_API_KEY")
 if not API_KEY:
     raise RuntimeError("PROXY_API_KEY environment variable is required")
@@ -118,25 +129,88 @@ def _estimate_tokens(messages: list[dict], call_key: str,
 # Core dispatch: submit one LLM call through the scheduler
 # ---------------------------------------------------------------------------
 
+_DISPATCH_MAX_RETRIES = 3
+_DISPATCH_RETRY_BACKOFF = 2.0
+
+
 async def _dispatch(messages: list[dict], session_int_id: int,
                     call_key: str, max_tokens: int) -> dict:
-    """Build a coro_factory, submit to the scheduler, return parsed result."""
+    """Build a coro_factory, submit to the scheduler, return parsed result.
+
+    Retries on transient OpenAI errors (JSON-parse 400s, 429 rate limits,
+    5xx) with exponential backoff.
+    """
     est_tokens = _estimate_tokens(messages, call_key, max_tokens)
 
     if ct.cost_tracker is not None:
         await ct.cost_tracker.check()
 
-    def coro_factory():
-        return _openai.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
-        )
+    last_exc: Exception | None = None
+    for attempt in range(_DISPATCH_MAX_RETRIES):
+        try:
+            def coro_factory():
+                return _openai.chat.completions.create(
+                    model=MODEL,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                )
 
-    response = await _scheduler.submit(
-        coro_factory, est_tokens, session_int_id, call_key,
-        label=call_key,
-    )
+            response = await _scheduler.submit(
+                coro_factory, est_tokens, session_int_id, call_key,
+                label=call_key,
+            )
+            break
+        except BadRequestError as exc:
+            last_exc = exc
+            if "could not parse the json body" in str(exc).lower():
+                delay = _DISPATCH_RETRY_BACKOFF * (2 ** attempt)
+                logger.warning(
+                    "Transient OpenAI JSON-parse error on %s (attempt %d/%d), "
+                    "retrying in %.1fs: %s",
+                    call_key, attempt + 1, _DISPATCH_MAX_RETRIES, delay, exc,
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.error("OpenAI BadRequestError on %s: %s", call_key, exc)
+            raise
+        except RateLimitError as exc:
+            last_exc = exc
+            retry_after = None
+            if exc.response is not None:
+                header = exc.response.headers.get("retry-after")
+                if header:
+                    try:
+                        retry_after = float(header)
+                    except (ValueError, TypeError):
+                        pass
+            delay = retry_after or _DISPATCH_RETRY_BACKOFF * (2 ** attempt)
+            logger.warning(
+                "OpenAI 429 rate limit on %s (attempt %d/%d), "
+                "sleeping %.1fs (retry-after=%s)",
+                call_key, attempt + 1, _DISPATCH_MAX_RETRIES,
+                delay, retry_after,
+            )
+            await asyncio.sleep(delay)
+            continue
+        except APIError as exc:
+            last_exc = exc
+            if exc.status_code and exc.status_code >= 500:
+                delay = _DISPATCH_RETRY_BACKOFF * (2 ** attempt)
+                logger.warning(
+                    "OpenAI %d error on %s (attempt %d/%d), retrying in %.1fs",
+                    exc.status_code, call_key,
+                    attempt + 1, _DISPATCH_MAX_RETRIES, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.error("OpenAI APIError on %s (status=%s): %s",
+                         call_key, exc.status_code, exc)
+            raise
+    else:
+        logger.error("OpenAI error on %s: retries exhausted (%d/%d): %s",
+                     call_key, _DISPATCH_MAX_RETRIES,
+                     _DISPATCH_MAX_RETRIES, last_exc)
+        raise last_exc  # type: ignore[misc]
 
     usage = None
     if response.usage is not None:
@@ -157,11 +231,10 @@ async def _dispatch(messages: list[dict], session_int_id: int,
     }
 
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler, _limiter, _active_scheduler_name
-    _limiter = RateLimiter(rpm=RPM, tpm=TPM)
+    _limiter = RateLimiter(rpm=_rpm, tpm=_tpm)
     _active_scheduler_name = SCHEDULER_NAME
     _scheduler = get_scheduler(_active_scheduler_name, _limiter)
     _scheduler.start()
@@ -283,6 +356,23 @@ async def submit_completion(session_id: str, req: CompletionRequest):
 @app.post("/sessions/{session_id}/completions/batch",
           response_model=BatchCompletionResponse)
 async def submit_batch(session_id: str, req: BatchCompletionRequest):
+    """Fan-out multiple LLM calls concurrently within a single session.
+
+    Error handling
+    --------------
+    Each sub-call is dispatched through ``_dispatch``, which already retries
+    transient OpenAI errors (JSON-parse 400s, 5xx) up to
+    ``_DISPATCH_MAX_RETRIES`` times with exponential backoff.
+
+    ``asyncio.gather`` is called with ``return_exceptions=True`` so that a
+    failure in one sub-call does not cancel or abort the others — all sub-calls
+    run to completion independently.  After gathering:
+
+    * If every sub-call succeeded, the full batch of completions is returned.
+    * If any sub-call still failed after its retries were exhausted, the
+      endpoint returns **502** with a detail string listing how many sub-calls
+      failed out of the total (all-or-nothing: partial successes are discarded).
+    """
     if not req.calls:
         return BatchCompletionResponse(completions=[])
 
@@ -294,7 +384,20 @@ async def submit_batch(session_id: str, req: BatchCompletionRequest):
         call_key = f"{call.call_type}:{call.call_detail}" if call.call_detail else call.call_type
         return await _dispatch(messages, int_id, call_key, max_tokens)
 
-    results = await asyncio.gather(*[_one(c) for c in req.calls])
+    results = await asyncio.gather(*[_one(c) for c in req.calls],
+                                   return_exceptions=True)
+
+    first_exc = next((r for r in results if isinstance(r, Exception)), None)
+    if first_exc is not None:
+        failed = [(i, r) for i, r in enumerate(results) if isinstance(r, Exception)]
+        for i, exc in failed:
+            logger.error("Batch sub-call %d (%s) failed: %s",
+                         i, req.calls[i].call_type, exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"{len(failed)}/{len(req.calls)} batch sub-calls failed: {first_exc}",
+        )
+
     return BatchCompletionResponse(
         completions=[CompletionResponse(**r) for r in results],
     )
@@ -323,6 +426,8 @@ class SimResetRequest(BaseModel):
 
 class SimConfigUpdateRequest(BaseModel):
     max_tokens: int | None = None
+    rpm: int | None = None
+    tpm: int | None = None
 
 
 @app.get("/sim/config", tags=["simulation"])
@@ -330,8 +435,8 @@ async def sim_config():
     """Return current server configuration (simulation endpoint)."""
     return {
         "scheduler": _active_scheduler_name,
-        "rpm": RPM,
-        "tpm": TPM,
+        "rpm": _rpm,
+        "tpm": _tpm,
         "max_tokens": _max_tokens,
         "cost_limit": COST_LIMIT,
         "model": MODEL,
@@ -342,14 +447,37 @@ async def sim_config():
 async def sim_config_update(req: SimConfigUpdateRequest):
     """Update server configuration (simulation endpoint).
 
-    Only provided fields are updated.  Supported: max_tokens.
+    Only provided fields are updated.  Supported: max_tokens, rpm, tpm.
+    When rpm or tpm change the rate limiter and scheduler are re-created so
+    the new limits take effect immediately.
     """
-    global _max_tokens
+    global _max_tokens, _rpm, _tpm, _limiter, _scheduler
     if req.max_tokens is not None:
         if req.max_tokens < 1:
             raise HTTPException(status_code=422, detail="max_tokens must be >= 1")
         _max_tokens = req.max_tokens
-    return {"max_tokens": _max_tokens}
+
+    rebuild_limiter = False
+    if req.rpm is not None:
+        if req.rpm < 1:
+            raise HTTPException(status_code=422, detail="rpm must be >= 1")
+        _rpm = req.rpm
+        rebuild_limiter = True
+    if req.tpm is not None:
+        if req.tpm < 1:
+            raise HTTPException(status_code=422, detail="tpm must be >= 1")
+        _tpm = req.tpm
+        rebuild_limiter = True
+
+    if rebuild_limiter and _limiter is not None:
+        if _scheduler is not None:
+            await _scheduler.stop()
+        _limiter = RateLimiter(rpm=_rpm, tpm=_tpm)
+        _scheduler = get_scheduler(_active_scheduler_name, _limiter)
+        _scheduler.start()
+        logger.info("Rate limiter re-created: rpm=%d tpm=%d", _rpm, _tpm)
+
+    return {"max_tokens": _max_tokens, "rpm": _rpm, "tpm": _tpm}
 
 
 @app.get("/sim/stats", tags=["simulation"])
@@ -396,7 +524,7 @@ async def sim_reset(req: SimResetRequest | None = None):
     if _scheduler is not None:
         await _scheduler.stop()
 
-    _limiter.reset()
+    _limiter = RateLimiter(rpm=_rpm, tpm=_tpm)
     init_cost_tracker(COST_LIMIT)
     _sessions = {}
     _next_int_id = 0
