@@ -7,7 +7,7 @@ connection).  Reports client-recorded latency and fetches server-side metrics.
 Usage::
 
     # Terminal 1: start the proxy
-    SCHEDULER=fifo uvicorn api:app --host 0.0.0.0 --port 8000
+    hypercorn api:app --host 0.0.0.0 --port 8000
 
     # Terminal 2: run the benchmark
     python sim_client.py --sessions 15 --scheduler fifo
@@ -413,7 +413,7 @@ def _parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--base-url", type=str, default="http://localhost:8000")
     parser.add_argument("--timeout", type=float, default=1200.0,
-                        help="HTTP request timeout in seconds (default: 600)")
+                        help="HTTP request timeout in seconds (default: 1200)")
     parser.add_argument("--cooldown", type=float, default=5.0,
                         help="Seconds to sleep between scheduler runs (default: 5)")
     parser.add_argument("--max-tokens", type=int, default=1024,

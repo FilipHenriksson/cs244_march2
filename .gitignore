@@ -3,3 +3,7 @@ __pycache__/
 .claude/
 results/
 experiments/
+logs/
+plots/
+scripts/
+.DS_Store
