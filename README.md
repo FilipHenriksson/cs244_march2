@@ -11,6 +11,10 @@ A research system that studies how different scheduling strategies affect perfor
 
 We run the **simulation** to benchmark schedulers; the **API** is used to deploy them. Both share the same schedulers, rate limiter, and cost tracker implementations.
 
+The deployment layer routes agent sessions through a central queue, pluggable scheduler, and rate limiter before dispatching to the OpenAI API:
+
+![Scheduling Proxy Architecture](system_architecture.png)
+
 See [docs/architecture.md](docs/architecture.md) for structure and [docs/API.md](docs/API.md) for the deployment API reference.
 
 ## Overview
