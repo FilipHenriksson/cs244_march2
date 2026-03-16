@@ -33,4 +33,4 @@ pip install -q --upgrade pip
 pip install -q -r requirements.txt
 
 echo "Done. Start with:"
-echo "  cd $APP_DIR && source venv/bin/activate && uvicorn api:app --host 0.0.0.0 --port 8000"
+echo "  cd $APP_DIR && source venv/bin/activate && hypercorn api:app --host 0.0.0.0 --port 8000"

@@ -2,6 +2,8 @@
 
 LLM scheduling proxy that manages scheduling, rate limiting, and system-prompt caching on behalf of multiple concurrent clients.
 
+**Client flexibility**: The `completions/batch` endpoint is a convenience wrapper around `completions`. Everything can be accomplished with the single `completions` endpoint — clients may fan out calls themselves or use `batch` for convenience. No client is forced to use `batch`.
+
 ## Authentication
 
 Every request must include a Bearer token:
@@ -76,7 +78,7 @@ Submit a single LLM call through the scheduler.
 
 #### `POST /sessions/{session_id}/completions/batch`
 
-Fan out multiple LLM calls concurrently within a single session.
+**Convenience wrapper** around `completions`. Fan out multiple LLM calls concurrently within a single session. Equivalent to issuing N parallel `POST /sessions/{session_id}/completions` requests — use whichever fits your client better.
 
 **Body**
 

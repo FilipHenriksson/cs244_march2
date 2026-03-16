@@ -7,7 +7,7 @@ fan-out/fan-in barriers; the server handles scheduling and rate limiting.
 Usage::
 
     # Terminal 1: start the proxy
-    uvicorn api:app --host 0.0.0.0 --port 8000
+    hypercorn api:app --host 0.0.0.0 --port 8000
 
     # Terminal 2: run this client
     python client_example.py

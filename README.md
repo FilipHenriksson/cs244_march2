@@ -2,6 +2,17 @@
 
 A research system that studies how different scheduling strategies affect performance when multiple LLM-powered agent sessions compete for rate-limited API access.
 
+## Two Layers
+
+| Layer | Purpose | Entry Point |
+|-------|---------|-------------|
+| **Simulation** (`sim/`) | Test and compare schedulers in controlled experiments | `python -m sim.runner` |
+| **Deployment** (`api.py`) | Deploy schedulers for production use by multiple clients | `hypercorn api:app` |
+
+We run the **simulation** to benchmark schedulers; the **API** is used to deploy them. Both share the same schedulers, rate limiter, and cost tracker implementations.
+
+See [docs/architecture.md](docs/architecture.md) for structure and [docs/API.md](docs/API.md) for the deployment API reference.
+
 ## Overview
 
 The system simulates a realistic multi-tenant LLM workload: multiple research sessions arrive over time, each spawning a tool-calling agent that fans out parallel LLM calls competing for a shared, rate-limited API. A pluggable scheduler sits between tools and the API, controlling dispatch order. By running the same workload through different schedulers, we can empirically compare their effect on latency, throughput, and fairness.
@@ -58,7 +69,7 @@ Each tool is a single LLM call with a specialized system prompt. Tools are desig
 
 `python -m sim.api_runner` drives the **strict** through the scheduling proxy (api.py) over HTTP. Each session runs as its own HTTP client, modeled as a separate machine.
 
-**Setup**: Start the API server in one terminal, run the benchmark in another. Requires `PROXY_API_KEY` in `.env` for auth. 
+**Setup**: Start the API server in one terminal, run the benchmark in another. Requires `PROXY_API_KEY` in `.env` for auth.
 
 ```bash
 # Terminal 1: start the proxy
@@ -67,6 +78,15 @@ hypercorn api:app --host 0.0.0.0 --port 8000
 # Terminal 2: run the benchmark
 python -m sim.api_runner --sessions 30 --schedulers fifo mapreduce mapreduce_skip_adaptive --max-tokens 2048
 ```
+
+### Accessing the API
+
+| Context | Base URL | Example |
+|---------|----------|---------|
+| **Local** | `http://localhost:8000` | `--base-url http://localhost:8000` |
+| **Remote** | `https://llmgateway.app` | `--base-url https://llmgateway.app` |
+
+Use the same endpoints for both. Authentication via `Authorization: Bearer <PROXY_API_KEY>` is required. Obtain the proxy key from the API admin before using. 
 
 ## Rate Limiter
 
@@ -219,7 +239,7 @@ python -m sim.runner --all-schedulers --sessions 30 --output-dir results/
 
 ```bash
 # Terminal 1: start the API server
-uvicorn api:app --host 0.0.0.0 --port 8000
+hypercorn api:app --host 0.0.0.0 --port 8000
 
 # Terminal 2: run api_runner (same CLI as sim.runner)
 python -m sim.api_runner --all-schedulers --sessions 15 --seed 42
@@ -246,8 +266,11 @@ python -m sim.api_runner --schedulers fifo mapreduce --sessions 10 --base-url ht
 
 ## Architecture
 
+See [docs/architecture.md](docs/architecture.md) for full structure. Summary:
+
 ```
 main.py                      Single-session entry point
+api.py                       Deployment server — scheduling proxy for multi-client use
 api_example.py               Example API client — strict pipeline over HTTP
 agent.py                     Research agent — strict pipeline (11 LLM calls)
 llm.py                       LLM call dispatcher (routes through scheduler)
