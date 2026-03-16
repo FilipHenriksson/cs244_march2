@@ -32,7 +32,8 @@ from tools.reviewers import _REVIEWERS
 from sim.workload import generate_workload
 
 ALL_SCHEDULERS = [
-    "backoff", "fifo", "mapreduce", "mapreduce_skip", "mapreduce_skip_adaptive",
+    "backoff", "fifo", "mapreduce", "mapreduce_events", "mapreduce_skip",
+    "mapreduce_skip_adaptive",
 ]
 
 STRICT_ANALYSTS = [
