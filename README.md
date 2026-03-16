@@ -268,35 +268,3 @@ python -m sim.api_runner --schedulers fifo mapreduce --sessions 10 --base-url ht
 | `--prompt-mode` | `strict` | `default` (LLM picks tools) or `strict` (fixed pipeline) |
 | `--output-dir` | -- | Directory for output files (auto-creates timestamped subdir) |
 
-## Architecture
-
-See [docs/architecture.md](docs/architecture.md) for full structure. Summary:
-
-```
-main.py                      Single-session entry point
-api.py                       Deployment server — scheduling proxy for multi-client use
-api_example.py               Example API client — strict pipeline over HTTP
-agent.py                     Research agent — strict pipeline (11 LLM calls)
-llm.py                       LLM call dispatcher (routes through scheduler)
-tools/
-  analysts.py                9 analyst tools (varied output lengths)
-  reviewers.py               3 reviewer tools (varied output lengths)
-prompts/
-  system.py                  Orchestrator agent system prompt
-  topics.py                  Research topic list (5 topics)
-schedulers/
-  backoff.py                 Exponential backoff (no queue)
-  fifo.py                    FIFO queue
-  mapreduce.py               Group-aware dynamic priority (auto-inferred sessions)
-  mapreduce_skip.py          MapReduce + TPM-aware skipping + learned tokens
-  mapreduce_skip_adaptive.py MapReduce Skip + output-aware secondary priority
-  deprecated/                Explored and deprecated schedulers (see above)
-sim/
-  runner.py                  Batch experiment runner (python -m sim.runner)
-  api_runner.py              API-based benchmark (python -m sim.api_runner)
-  workload.py                Workload generation (arrivals + prompt assignment)
-  rate_limiter.py            Token-bucket rate limiter (RPM + TPM)
-  cost_tracker.py            Budget tracking and kill switch
-  trace.py                   Call logging and timeline visualization
-  metrics.py                 Session statistics and comparison tables
-```

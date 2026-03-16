@@ -14,6 +14,7 @@ GET    /sim/stats                           – server-side metrics snapshot
 POST   /sim/reset                           – reset state for a fresh benchmark run
 GET    /sim/config                          – current server configuration
 PATCH  /sim/config                          – update config (max_tokens, rpm, tpm)
+GET    /sim/events                          – SSE stream of global scheduler events (all sessions)
 
 The server owns scheduling, rate limiting, and system-prompt caching.
 Clients drive their own agent loops and conversation state.
@@ -25,6 +26,9 @@ Set ``PROXY_API_KEY`` in the environment (or ``.env``); the server refuses
 to start if it is missing.  Clients must send::
 
     Authorization: Bearer <PROXY_API_KEY>
+
+SSE endpoints also accept ``?token=<PROXY_API_KEY>`` as a query parameter
+since browser EventSource does not support custom headers.
 
 Configuration (environment variables)
 --------------------------------------
@@ -45,8 +49,9 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 from openai import AsyncOpenAI, APIConnectionError, BadRequestError, RateLimitError, APIError
 from pydantic import BaseModel
 
@@ -63,6 +68,7 @@ load_dotenv()
 
 from sim import RateLimiter, init_cost_tracker
 from schedulers import get_scheduler
+from events import global_bus, session_buses
 import sim.cost_tracker as ct
 
 # ---------------------------------------------------------------------------
@@ -252,14 +258,33 @@ async def lifespan(app: FastAPI):
     init_cost_tracker(COST_LIMIT)
     yield
     await _scheduler.stop()
+    global_bus.close()
+    session_buses.close_all()
 
 
 app = FastAPI(title="CS244 LLM Scheduling Proxy", lifespan=lifespan)
 
+# CORS for browser-based frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _check_auth(request: Request) -> bool:
+    """Check Bearer header OR query param token."""
+    if request.headers.get("Authorization") == f"Bearer {API_KEY}":
+        return True
+    if request.query_params.get("token") == API_KEY:
+        return True
+    return False
+
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    if request.headers.get("Authorization") != f"Bearer {API_KEY}":
+    if not _check_auth(request):
         return Response(status_code=401, content="Unauthorized")
     return await call_next(request)
 
@@ -323,6 +348,40 @@ def _build_messages(call_type: str, user_messages: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# SSE event stream helpers
+# ---------------------------------------------------------------------------
+
+_SSE_HEARTBEAT_INTERVAL = 15  # seconds
+
+
+async def _sse_generator(queue: asyncio.Queue):
+    """Yield SSE-formatted events from an async queue.
+
+    Sends a heartbeat comment every 15s to keep the connection alive
+    through proxies and load balancers.
+    """
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    queue.get(), timeout=_SSE_HEARTBEAT_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+
+            if event is None:
+                # Sentinel — session closed or server shutting down
+                yield f"event: done\ndata: {{}}\n\n"
+                return
+
+            event_type = event.get("type", "message")
+            yield f"event: {event_type}\ndata: {json.dumps(event)}\n\n"
+    except asyncio.CancelledError:
+        return
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -351,7 +410,41 @@ async def create_session():
         "created_at": datetime.now(timezone.utc).isoformat(),
         "int_id": int_id,
     }
+    # Pre-create the session event bus so it's ready before any calls
+    session_buses.get_or_create(int_id)
     return SessionResponse(session_id=sid)
+
+
+@app.get("/sim/events", tags=["simulation"])
+async def global_events():
+    """SSE stream of all scheduler events across all sessions.
+
+    Includes per-call lifecycle events (enqueued, dispatched, completed,
+    failed, rate_limited) and periodic queue_snapshot events showing the
+    full pending queue and in-flight calls.
+
+    Intended for the demo frontend to visualize the global queue state.
+
+    Auth: supports ``?token=<key>`` for browser EventSource compatibility.
+    """
+    queue = global_bus.subscribe()
+
+    async def cleanup_generator():
+        try:
+            async for chunk in _sse_generator(queue):
+                yield chunk
+        finally:
+            global_bus.unsubscribe(queue)
+
+    return StreamingResponse(
+        cleanup_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/sessions/{session_id}/completions", response_model=CompletionResponse)
@@ -368,6 +461,10 @@ async def submit_completion(session_id: str, req: CompletionRequest):
           response_model=BatchCompletionResponse)
 async def submit_batch(session_id: str, req: BatchCompletionRequest):
     """Fan-out multiple LLM calls concurrently within a single session.
+
+    Emits a ``batch_progress`` event to the session bus each time a
+    sub-call completes, so SSE listeners can track incremental progress
+    (e.g. "3/5 analysts done").
 
     Error handling
     --------------
@@ -388,12 +485,40 @@ async def submit_batch(session_id: str, req: BatchCompletionRequest):
         return BatchCompletionResponse(completions=[])
 
     int_id = _resolve_session(session_id)
+    total = len(req.calls)
+    completed_count = 0
+    completed_keys: list[str] = []
+    _progress_lock = asyncio.Lock()
 
     async def _one(call: CompletionRequest) -> dict:
+        nonlocal completed_count
         messages = _build_messages(call.call_type, call.messages)
         max_tokens = call.max_tokens or _max_tokens
         call_key = f"{call.call_type}:{call.call_detail}" if call.call_detail else call.call_type
-        return await _dispatch(messages, int_id, call_key, max_tokens)
+        result = await _dispatch(messages, int_id, call_key, max_tokens)
+
+        # Emit batch_progress event
+        async with _progress_lock:
+            completed_count += 1
+            completed_keys.append(call_key)
+            session_buses.emit(int_id, {
+                "type": "batch_progress",
+                "session_id": int_id,
+                "completed": completed_count,
+                "total": total,
+                "call_keys_done": list(completed_keys),
+                "latest": call_key,
+                "content": result["content"],
+            })
+            global_bus.emit({
+                "type": "batch_progress",
+                "session_id": int_id,
+                "completed": completed_count,
+                "total": total,
+                "latest": call_key,
+            })
+
+        return result
 
     results = await asyncio.gather(*[_one(c) for c in req.calls],
                                    return_exceptions=True)
@@ -418,16 +543,15 @@ async def submit_batch(session_id: str, req: BatchCompletionRequest):
 async def delete_session(session_id: str):
     if session_id not in _sessions:
         raise HTTPException(status_code=404, detail="Session not found")
+    int_id = _sessions[session_id]["int_id"]
     del _sessions[session_id]
+    # Close the session's event bus (sends sentinel to SSE listeners)
+    session_buses.close(int_id)
     return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
 # Simulation / benchmarking endpoints
-#
-# These endpoints expose server-side metrics and allow resetting state
-# between benchmark runs.  They are intended for simulation use only and
-# should NOT be exposed in a production deployment.
 # ---------------------------------------------------------------------------
 
 
@@ -493,11 +617,7 @@ async def sim_config_update(req: SimConfigUpdateRequest):
 
 @app.get("/sim/stats", tags=["simulation"])
 async def sim_stats():
-    """Snapshot of server-side metrics (simulation endpoint).
-
-    Returns rate-limiter counters, cost-tracker totals, scheduler stats,
-    and the number of active sessions.
-    """
+    """Snapshot of server-side metrics (simulation endpoint)."""
     rl = _limiter.stats if _limiter is not None else {}
 
     cost = {}
@@ -520,6 +640,7 @@ async def sim_stats():
         "cost": cost,
         "scheduler_stats": sched_stats,
         "active_sessions": len(_sessions),
+        "sse_global_subscribers": global_bus.subscriber_count,
     }
 
 
@@ -534,6 +655,9 @@ async def sim_reset(req: SimResetRequest | None = None):
 
     if _scheduler is not None:
         await _scheduler.stop()
+
+    # Close all session event buses (sends sentinels to any SSE listeners)
+    session_buses.close_all()
 
     _limiter = RateLimiter(rpm=_rpm, tpm=_tpm)
     init_cost_tracker(COST_LIMIT)

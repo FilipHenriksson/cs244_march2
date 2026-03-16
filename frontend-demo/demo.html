@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Scheduler — Live Demo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   DESIGN: Industrial control room — dark, dense, monospace-heavy.
+   Two-panel layout: left = scheduler queue, right = workflow output.
+   ============================================================ */
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --bg:       #0a0c10;
+  --bg2:      #12151c;
+  --bg3:      #181c26;
+  --bg4:      #1f2433;
+  --tx:       #dfe1e8;
+  --tx2:      #8a8fa2;
+  --tx3:      #4e5366;
+  --accent:   #636bff;
+  --accent2:  #8d93ff;
+  --accent-bg:rgba(99,107,255,0.07);
+  --accent-b: rgba(99,107,255,0.22);
+  --green:    #2dd4a0;
+  --green-bg: rgba(45,212,160,0.07);
+  --amber:    #e8a32e;
+  --amber-bg: rgba(232,163,46,0.07);
+  --coral:    #e95f5f;
+  --coral-bg: rgba(233,95,95,0.06);
+  --teal:     #28c8b8;
+  --border:   rgba(255,255,255,0.05);
+  --border2:  rgba(255,255,255,0.09);
+  --mono:     'JetBrains Mono', monospace;
+  --sans:     'DM Sans', system-ui, sans-serif;
+  --radius:   8px;
+}
+html, body { height:100%; background:var(--bg); color:var(--tx); font-family:var(--sans); font-size:13px; overflow:hidden; }
+a { color:var(--accent2); }
+
+/* Layout */
+.app { display:grid; grid-template-rows:auto 1fr; height:100vh; }
+.topbar { display:flex; align-items:center; justify-content:space-between; padding:10px 20px; border-bottom:0.5px solid var(--border2); background:var(--bg2); z-index:10; }
+.topbar h1 { font-size:14px; font-weight:600; font-family:var(--sans); display:flex; align-items:center; gap:8px; }
+.topbar .controls { display:flex; align-items:center; gap:10px; }
+.topbar input, .topbar select { font-family:var(--mono); font-size:12px; padding:5px 10px; background:var(--bg3); border:0.5px solid var(--border2); border-radius:6px; color:var(--tx); outline:none; }
+.topbar input:focus, .topbar select:focus { border-color:var(--accent); }
+.topbar input { width:200px; }
+.topbar button { font-family:var(--mono); font-size:12px; font-weight:500; padding:5px 14px; border-radius:6px; border:none; cursor:pointer; transition:all .15s; }
+.btn-primary { background:var(--accent); color:#fff; }
+.btn-primary:hover { background:var(--accent2); }
+.btn-primary:active { transform:scale(0.97); }
+.btn-primary:disabled { opacity:0.4; cursor:not-allowed; }
+.btn-secondary { background:var(--bg3); color:var(--tx2); border:0.5px solid var(--border2); }
+.btn-secondary:hover { background:var(--bg4); color:var(--tx); }
+
+.panels { display:grid; grid-template-columns:1fr 1fr; overflow:hidden; }
+.panel { overflow-y:auto; padding:14px 18px 24px; }
+.panel::-webkit-scrollbar { width:4px; }
+.panel::-webkit-scrollbar-thumb { background:var(--border2); border-radius:2px; }
+.panel-left { border-right:0.5px solid var(--border2); }
+
+/* Live dot */
+.live-dot { width:7px; height:7px; border-radius:50%; display:inline-block; }
+.live-dot.off { background:var(--tx3); }
+.live-dot.on { background:var(--green); animation:pulse 2s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+/* Stats row */
+.stats { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin-bottom:12px; }
+.stat { background:var(--bg2); border:0.5px solid var(--border); border-radius:var(--radius); padding:8px 10px; }
+.stat-label { font-size:10px; color:var(--tx3); text-transform:uppercase; letter-spacing:.06em; margin-bottom:2px; }
+.stat-val { font-size:18px; font-weight:600; font-family:var(--mono); }
+
+/* Section labels */
+.sl { font-size:10px; color:var(--tx3); text-transform:uppercase; letter-spacing:.08em; margin:14px 0 6px; display:flex; align-items:center; gap:8px; }
+.sl::after { content:''; flex:1; height:0.5px; background:var(--border); }
+
+/* Phase tracker */
+.phase-bar { display:flex; align-items:center; padding:8px 12px; background:var(--bg2); border:0.5px solid var(--border); border-radius:var(--radius); margin-bottom:12px; gap:0; }
+.phase-item { display:flex; align-items:center; gap:4px; font-size:11px; flex:1; }
+.phase-dot { width:7px; height:7px; border-radius:50%; border:1.5px solid var(--tx3); flex-shrink:0; }
+.phase-dot.done { background:var(--green); border-color:var(--green); }
+.phase-dot.active { background:var(--accent); border-color:var(--accent); animation:pulse 1.5s ease-in-out infinite; }
+.phase-name { color:var(--tx3); }
+.phase-name.done { color:var(--tx2); }
+.phase-name.active { color:var(--tx); font-weight:500; }
+.phase-sep { width:16px; height:0.5px; background:var(--tx3); opacity:.3; flex-shrink:0; }
+.phase-count { font-family:var(--mono); font-size:10px; color:var(--tx3); }
+.phase-count.active { color:var(--accent2); }
+
+/* Badge */
+.badge { display:inline-block; font-size:9px; font-family:var(--mono); padding:1px 5px; border-radius:3px; margin-left:3px; vertical-align:middle; }
+.badge-you { background:var(--accent-bg); color:var(--accent2); border:0.5px solid var(--accent-b); }
+.badge-rate { background:var(--amber-bg); color:var(--amber); }
+.badge-done { background:var(--green-bg); color:var(--green); }
+
+/* Rate banner */
+.rate-banner { display:none; align-items:center; gap:6px; padding:6px 10px; background:var(--amber-bg); border:0.5px solid rgba(232,163,46,.12); border-radius:6px; font-size:11px; color:var(--amber); font-family:var(--mono); margin-bottom:8px; }
+.rate-banner.visible { display:flex; }
+
+/* Queue items */
+.q-item { display:grid; grid-template-columns:24px 1fr 48px 44px; align-items:center; gap:4px; padding:5px 8px; background:var(--bg2); border:0.5px solid var(--border); border-radius:6px; margin-bottom:3px; animation:fadeSlideIn .25s ease-out; }
+.q-item.hl { border-color:var(--accent-b); background:var(--accent-bg); }
+.q-pos { font-family:var(--mono); font-size:10px; color:var(--tx3); text-align:center; }
+.q-info { display:flex; align-items:center; gap:6px; overflow:hidden; }
+.q-name { font-family:var(--mono); font-size:11px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.q-session { font-size:10px; color:var(--tx3); white-space:nowrap; }
+.q-pri { font-family:var(--mono); font-size:11px; text-align:right; }
+.q-wait { font-family:var(--mono); font-size:10px; color:var(--tx3); text-align:right; }
+
+/* In-flight items */
+.if-item { display:grid; grid-template-columns:1fr 48px 56px; align-items:center; gap:4px; padding:5px 8px; background:var(--bg2); border:0.5px solid var(--border); border-radius:6px; margin-bottom:3px; animation:fadeSlideIn .25s ease-out; }
+.if-item.hl { border-color:var(--accent-b); background:var(--accent-bg); }
+.if-elapsed { font-family:var(--mono); font-size:11px; color:var(--tx2); text-align:right; }
+.bar-track { height:3px; border-radius:2px; background:var(--bg4); overflow:hidden; }
+.bar-fill { height:100%; border-radius:2px; background:var(--accent); animation:barPulse 2.5s ease-in-out infinite; }
+@keyframes barPulse { 0%{width:15%} 50%{width:80%} 100%{width:15%} }
+
+/* Completed items */
+.c-item { display:grid; grid-template-columns:1fr 52px 24px; align-items:center; gap:4px; padding:4px 8px; background:var(--bg2); border:0.5px solid var(--border); border-radius:6px; margin-bottom:3px; opacity:.5; animation:fadeSlideIn .25s ease-out; }
+.c-item.hl { opacity:.7; border-color:var(--accent-b); }
+.c-lat { font-family:var(--mono); font-size:11px; color:var(--green); text-align:right; }
+.c-chk { color:var(--green); text-align:right; font-size:13px; }
+
+/* Event log */
+.ev-log { padding:8px; background:var(--bg2); border:0.5px solid var(--border); border-radius:var(--radius); max-height:130px; overflow-y:auto; font-family:var(--mono); font-size:10px; }
+.ev-row { display:flex; gap:6px; padding:1.5px 0; color:var(--tx3); }
+.ev-ts { min-width:52px; }
+.ev-type { min-width:60px; }
+.ev-type.enq { color:var(--accent2); }
+.ev-type.dis { color:var(--teal); }
+.ev-type.cmp { color:var(--green); }
+.ev-type.fail { color:var(--coral); }
+.ev-type.rate { color:var(--amber); }
+.ev-type.bat { color:var(--accent2); }
+.ev-detail { color:var(--tx2); }
+
+/* ---- Right panel: Chat ---- */
+.chat-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; padding-bottom:10px; border-bottom:0.5px solid var(--border2); }
+.chat-header h2 { font-size:14px; font-weight:600; }
+.session-tag { font-size:11px; font-family:var(--mono); color:var(--accent2); background:var(--accent-bg); padding:2px 8px; border-radius:4px; }
+.chat-body { display:flex; flex-direction:column; gap:12px; }
+
+.msg { border-radius:10px; padding:10px 14px; font-size:13px; line-height:1.6; animation:fadeSlideIn .3s ease-out; }
+.msg-user { background:var(--accent); color:#fff; border-bottom-right-radius:3px; max-width:85%; align-self:flex-end; }
+.msg-sys { background:var(--bg3); border:0.5px solid var(--border); border-bottom-left-radius:3px; }
+.msg-label { font-size:10px; color:var(--tx3); margin-bottom:4px; font-weight:500; text-transform:uppercase; letter-spacing:.04em; display:flex; align-items:center; gap:6px; }
+.step-badge { font-family:var(--mono); font-size:9px; background:var(--bg4); padding:1px 6px; border-radius:3px; color:var(--tx2); }
+
+/* Analyst cards */
+.analyst-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:6px; }
+.ac { background:var(--bg2); border:0.5px solid var(--border); border-radius:var(--radius); padding:8px 10px; min-height:52px; transition:all .3s; }
+.ac.done { border-color:rgba(45,212,160,.18); }
+.ac.active { border-color:var(--accent-b); background:var(--accent-bg); }
+.ac.pending { opacity:.35; }
+.ac-hd { display:flex; align-items:center; justify-content:space-between; margin-bottom:3px; }
+.ac-nm { font-family:var(--mono); font-size:10px; font-weight:500; }
+.ac-st { font-size:10px; font-family:var(--mono); }
+.ac-st.done { color:var(--green); }
+.ac-st.active { color:var(--accent2); }
+.ac-st.pending { color:var(--tx3); }
+.ac-body { font-size:11px; color:var(--tx2); line-height:1.5; max-height:72px; overflow:hidden; position:relative; }
+.ac-body.has-content::after { content:''; position:absolute; bottom:0; left:0; right:0; height:20px; background:linear-gradient(transparent,var(--bg2)); pointer-events:none; }
+.ac.active .ac-body.has-content::after { background:linear-gradient(transparent,#151929); }
+
+/* Ghost steps */
+.ghost { opacity:.2; transition:opacity .5s; }
+.ghost.revealed { opacity:1; }
+.ghost .msg-sys { border:0.5px dashed var(--tx3); background:transparent; color:var(--tx3); font-style:italic; font-size:12px; padding:6px 14px; transition:all .3s; }
+.ghost.revealed .msg-sys { border-style:solid; border-color:var(--border); background:var(--bg3); color:var(--tx); font-style:normal; font-size:13px; padding:10px 14px; }
+
+/* Reviewer cards */
+.reviewer-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-top:6px; }
+
+/* Typing indicator */
+.typing { display:inline-flex; gap:3px; padding:2px 0; }
+.typing i { width:4px; height:4px; border-radius:50%; background:var(--tx3); animation:blink 1.4s infinite; }
+.typing i:nth-child(2) { animation-delay:.2s; }
+.typing i:nth-child(3) { animation-delay:.4s; }
+@keyframes blink { 0%,60%,100%{opacity:.3} 30%{opacity:1} }
+@keyframes fadeSlideIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+
+/* Status bar */
+.status-bar { font-size:11px; color:var(--tx3); font-family:var(--mono); padding:6px 20px; border-top:0.5px solid var(--border); background:var(--bg2); display:flex; align-items:center; gap:16px; }
+.status-bar .sep { color:var(--border2); }
+
+/* Idle state */
+.idle-msg { color:var(--tx3); font-style:italic; font-size:13px; padding:40px 0; text-align:center; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Top bar -->
+  <div class="topbar">
+    <h1><span class="live-dot off" id="sse-dot"></span> LLM Scheduler — Live Demo</h1>
+    <div class="controls">
+      <input type="text" id="inp-url" placeholder="Proxy URL" value="http://localhost:8000">
+      <input type="text" id="inp-token" placeholder="API token">
+      <input type="text" id="inp-prompt" placeholder="Research prompt..." value="What are the latest advances in quantum error correction?">
+      <button class="btn-primary" id="btn-run" onclick="startDemo()">Run</button>
+      <button class="btn-secondary" id="btn-stop" onclick="stopDemo()" style="display:none">Stop</button>
+    </div>
+  </div>
+
+  <!-- Two panels -->
+  <div class="panels">
+
+    <!-- LEFT: Queue -->
+    <div class="panel panel-left" id="panel-left">
+      <div class="stats" id="stats-row">
+        <div class="stat"><div class="stat-label">Pending</div><div class="stat-val" id="st-pending" style="color:var(--accent2)">0</div></div>
+        <div class="stat"><div class="stat-label">In flight</div><div class="stat-val" id="st-inflight" style="color:var(--green)">0</div></div>
+        <div class="stat"><div class="stat-label">Completed</div><div class="stat-val" id="st-completed">0</div></div>
+        <div class="stat"><div class="stat-label">Avg latency</div><div class="stat-val" id="st-latency" style="color:var(--amber)">—</div></div>
+      </div>
+
+      <div style="font-size:10px;color:var(--tx3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">
+        Your session <span class="badge badge-you" id="my-session-label">—</span>
+      </div>
+      <div class="phase-bar" id="phase-bar">
+        <div class="phase-item"><div class="phase-dot" id="pd-plan"></div><span class="phase-name" id="pn-plan">Plan</span></div><div class="phase-sep"></div>
+        <div class="phase-item"><div class="phase-dot" id="pd-analysts"></div><span class="phase-name" id="pn-analysts">Analysts</span><span class="phase-count" id="pc-analysts"></span></div><div class="phase-sep"></div>
+        <div class="phase-item"><div class="phase-dot" id="pd-synth"></div><span class="phase-name" id="pn-synth">Synth</span></div><div class="phase-sep"></div>
+        <div class="phase-item"><div class="phase-dot" id="pd-review"></div><span class="phase-name" id="pn-review">Review</span><span class="phase-count" id="pc-review"></span></div><div class="phase-sep"></div>
+        <div class="phase-item"><div class="phase-dot" id="pd-final"></div><span class="phase-name" id="pn-final">Final</span></div>
+      </div>
+
+      <div class="rate-banner" id="rate-banner">&#9202; <span id="rate-msg">RPM throttle</span></div>
+
+      <div class="sl">Pending</div>
+      <div id="pending-list"></div>
+
+      <div class="sl">In flight</div>
+      <div id="inflight-list"></div>
+
+      <div class="sl">Completed</div>
+      <div id="completed-list"></div>
+
+      <div class="sl">Event stream</div>
+      <div class="ev-log" id="ev-log"></div>
+    </div>
+
+    <!-- RIGHT: Chat output -->
+    <div class="panel" id="panel-right">
+      <div class="chat-header">
+        <h2>Workflow output</h2>
+        <div class="session-tag" id="chat-session-tag">—</div>
+      </div>
+      <div class="chat-body" id="chat-body">
+        <div class="idle-msg" id="idle-msg">Enter a prompt and click Run to start the demo.</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ============================================================
+// STATE
+// ============================================================
+let BASE_URL = '';
+let TOKEN = '';
+let mySessionId = null;   // UUID
+let myIntId = null;        // int (from SSE events)
+let globalSSE = null;
+let sessionSSE = null;
+let running = false;
+let abortCtrl = null;
+
+// Tracking
+let completedCount = 0;
+let latencies = [];
+let startTime = 0;
+
+// Analyst/reviewer names (must match client_example.py)
+const ANALYSTS = ['analyst_web_research','analyst_summarizer','analyst_deep_analysis','analyst_historical_context','analyst_statistical'];
+const REVIEWERS = ['review_citations','review_style','review_facts'];
+
+// Per-call state for chat panel
+const callState = {};  // call_key -> { status, content, latency_ms }
+
+// ============================================================
+// HELPERS
+// ============================================================
+function $(id) { return document.getElementById(id); }
+
+function authHeaders() {
+  return { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
+}
+
+async function api(method, path, body) {
+  const opts = { method, headers: authHeaders(), signal: abortCtrl?.signal };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(`${BASE_URL}${path}`, opts);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${await r.text()}`);
+  if (r.status === 204) return null;
+  return r.json();
+}
+
+function elapsed() { return ((Date.now() - startTime) / 1000).toFixed(1); }
+
+function priColor(pri) {
+  if (pri >= 0.9) return 'var(--green)';
+  if (pri >= 0.4) return 'var(--amber)';
+  return 'var(--coral)';
+}
+
+function shortKey(k) {
+  // analyst_web_research -> web_research
+  return k.replace('analyst_','').replace('review_','').replace('orchestrator:','orch:');
+}
+
+// ============================================================
+// SSE — Global event stream
+// ============================================================
+function connectGlobalSSE() {
+  if (globalSSE) globalSSE.close();
+  const url = `${BASE_URL}/sim/events?token=${encodeURIComponent(TOKEN)}`;
+  globalSSE = new EventSource(url);
+  globalSSE.onopen = () => { $('sse-dot').className = 'live-dot on'; };
+  globalSSE.onerror = () => { $('sse-dot').className = 'live-dot off'; };
+
+  globalSSE.addEventListener('queue_snapshot', (e) => {
+    const d = JSON.parse(e.data);
+    renderQueueSnapshot(d);
+  });
+  globalSSE.addEventListener('call_enqueued', (e) => {
+    const d = JSON.parse(e.data);
+    addEventLog('enq', `S${d.session_id} ${shortKey(d.call_key)} pri=${d.priority}`);
+  });
+  globalSSE.addEventListener('call_dispatched', (e) => {
+    const d = JSON.parse(e.data);
+    addEventLog('dis', `S${d.session_id} ${shortKey(d.call_key)}`);
+    if (d.session_id === myIntId) updateCallState(d.call_key, 'active');
+  });
+  globalSSE.addEventListener('call_completed', (e) => {
+    const d = JSON.parse(e.data);
+    completedCount++;
+    if (d.latency_ms) latencies.push(d.latency_ms);
+    addEventLog('cmp', `S${d.session_id} ${shortKey(d.call_key)} ${d.latency_ms}ms`);
+    $('st-completed').textContent = completedCount;
+    if (latencies.length) {
+      const avg = Math.round(latencies.reduce((a,b)=>a+b,0) / latencies.length);
+      $('st-latency').textContent = avg > 1000 ? (avg/1000).toFixed(1)+'s' : avg+'ms';
+    }
+  });
+  globalSSE.addEventListener('call_failed', (e) => {
+    const d = JSON.parse(e.data);
+    addEventLog('fail', `S${d.session_id} ${shortKey(d.call_key)} ERR`);
+  });
+  globalSSE.addEventListener('rate_limited', (e) => {
+    const d = JSON.parse(e.data);
+    addEventLog('rate', `${d.reason.toUpperCase()} wait ${d.wait_seconds}s`);
+    $('rate-banner').classList.add('visible');
+    $('rate-msg').textContent = `${d.reason.toUpperCase()} throttle — wait ${d.wait_seconds}s`;
+    clearTimeout(window._rateBannerTimeout);
+    window._rateBannerTimeout = setTimeout(() => $('rate-banner').classList.remove('visible'), d.wait_seconds * 1000 + 500);
+  });
+  globalSSE.addEventListener('batch_progress', (e) => {
+    const d = JSON.parse(e.data);
+    addEventLog('bat', `S${d.session_id} batch ${d.completed}/${d.total} — ${shortKey(d.latest)}`);
+  });
+  globalSSE.addEventListener('done', () => {
+    globalSSE.close();
+    $('sse-dot').className = 'live-dot off';
+  });
+}
+
+// Session SSE — gets content for batch_progress
+function connectSessionSSE(sessionId) {
+  if (sessionSSE) sessionSSE.close();
+  const url = `${BASE_URL}/sessions/${sessionId}/events?token=${encodeURIComponent(TOKEN)}`;
+  sessionSSE = new EventSource(url);
+
+  sessionSSE.addEventListener('batch_progress', (e) => {
+    const d = JSON.parse(e.data);
+    // d.content has the LLM output, d.latest is the call_key
+    if (d.content) {
+      updateCallContent(d.latest, d.content, d.completed, d.total);
+    }
+  });
+  sessionSSE.addEventListener('call_dispatched', (e) => {
+    const d = JSON.parse(e.data);
+    updateCallState(d.call_key, 'active');
+  });
+  sessionSSE.addEventListener('call_completed', (e) => {
+    const d = JSON.parse(e.data);
+    updateCallLatency(d.call_key, d.latency_ms);
+  });
+  sessionSSE.addEventListener('done', () => { sessionSSE.close(); });
+}
+
+// ============================================================
+// RENDER — Queue snapshot (left panel)
+// ============================================================
+function renderQueueSnapshot(snap) {
+  $('st-pending').textContent = snap.pending_count;
+  $('st-inflight').textContent = snap.in_flight_count;
+
+  // Pending
+  const pl = $('pending-list');
+  pl.innerHTML = '';
+  snap.pending.forEach((item, i) => {
+    const isMine = item.session_id === myIntId;
+    const div = document.createElement('div');
+    div.className = `q-item${isMine ? ' hl' : ''}`;
+    div.innerHTML = `
+      <div class="q-pos">#${i+1}</div>
+      <div class="q-info">
+        <span class="q-name">${shortKey(item.call_key)}</span>
+        <span class="q-session">S${item.session_id}${isMine ? '<span class="badge badge-you">you</span>' : ''}</span>
+      </div>
+      <div class="q-pri" style="color:${priColor(item.priority)}">${item.priority.toFixed(2)}</div>
+      <div class="q-wait">${(item.wait_ms/1000).toFixed(1)}s</div>`;
+    pl.appendChild(div);
+
+    // Update pending call cards in chat
+    if (isMine) updateCallQueuePos(item.call_key, i);
+  });
+
+  // In-flight
+  const il = $('inflight-list');
+  il.innerHTML = '';
+  (snap.in_flight || []).forEach(item => {
+    const isMine = item.session_id === myIntId;
+    const ago = item.dispatched_at ? ((Date.now()/1000 - item.dispatched_at)).toFixed(1) : '?';
+    const div = document.createElement('div');
+    div.className = `if-item${isMine ? ' hl' : ''}`;
+    div.innerHTML = `
+      <div class="q-info">
+        <span class="q-name">${shortKey(item.call_key)}</span>
+        <span class="q-session">S${item.session_id}${isMine ? '<span class="badge badge-you">you</span>' : ''}</span>
+      </div>
+      <div class="if-elapsed">${ago}s</div>
+      <div class="bar-track"><div class="bar-fill"></div></div>`;
+    il.appendChild(div);
+  });
+}
+
+// ============================================================
+// RENDER — Event log
+// ============================================================
+function addEventLog(type, detail) {
+  const log = $('ev-log');
+  const div = document.createElement('div');
+  div.className = 'ev-row';
+  const typeClass = {enq:'enq',dis:'dis',cmp:'cmp',fail:'fail',rate:'rate',bat:'bat'}[type] || '';
+  const label = {enq:'enqueued',dis:'dispatch',cmp:'completed',fail:'failed',rate:'throttle',bat:'batch'}[type] || type;
+  div.innerHTML = `<span class="ev-ts">${elapsed()}s</span><span class="ev-type ${typeClass}">${label}</span><span class="ev-detail">${detail}</span>`;
+  log.prepend(div);
+  // Keep max 80 entries
+  while (log.children.length > 80) log.removeChild(log.lastChild);
+}
+
+// ============================================================
+// RENDER — Chat output (right panel)
+// ============================================================
+function setPhase(name, status) {
+  const dotId = `pd-${name}`;
+  const nameId = `pn-${name}`;
+  const dot = $(dotId);
+  const nm = $(nameId);
+  if (!dot) return;
+  dot.className = `phase-dot ${status}`;
+  nm.className = `phase-name ${status}`;
+}
+
+function updateCallState(callKey, status) {
+  if (!callState[callKey]) callState[callKey] = {};
+  callState[callKey].status = status;
+  // Update the card in the DOM
+  const card = document.querySelector(`[data-call="${callKey}"]`);
+  if (!card) return;
+  card.className = `ac ${status}`;
+  const st = card.querySelector('.ac-st');
+  if (st) {
+    st.className = `ac-st ${status}`;
+    st.textContent = status === 'active' ? 'streaming...' : status === 'done' ? '✓' : 'pending';
+  }
+  if (status === 'active') {
+    const body = card.querySelector('.ac-body');
+    if (body && !body.textContent.trim()) {
+      body.innerHTML = '<span class="typing"><i></i><i></i><i></i></span>';
+    }
+  }
+}
+
+function updateCallContent(callKey, content, completed, total) {
+  if (!callState[callKey]) callState[callKey] = {};
+  callState[callKey].content = content;
+  callState[callKey].status = 'done';
+  const card = document.querySelector(`[data-call="${callKey}"]`);
+  if (!card) return;
+  card.className = 'ac done';
+  const st = card.querySelector('.ac-st');
+  if (st) { st.className = 'ac-st done'; }
+  const body = card.querySelector('.ac-body');
+  if (body) {
+    body.textContent = content.slice(0, 280);
+    if (content.length > 280) body.classList.add('has-content');
+  }
+
+  // Update phase count
+  const isAnalyst = ANALYSTS.includes(callKey);
+  const isReviewer = REVIEWERS.includes(callKey);
+  if (isAnalyst) {
+    $('pc-analysts').textContent = `${completed}/${total}`;
+    $('pc-analysts').className = 'phase-count active';
+  }
+  if (isReviewer) {
+    $('pc-review').textContent = `${completed}/${total}`;
+    $('pc-review').className = 'phase-count active';
+  }
+}
+
+function updateCallLatency(callKey, latencyMs) {
+  if (!callState[callKey]) callState[callKey] = {};
+  callState[callKey].latency_ms = latencyMs;
+  const card = document.querySelector(`[data-call="${callKey}"]`);
+  if (!card) return;
+  const st = card.querySelector('.ac-st');
+  if (st) {
+    st.className = 'ac-st done';
+    st.textContent = `✓ ${latencyMs > 1000 ? (latencyMs/1000).toFixed(1)+'s' : latencyMs+'ms'}`;
+  }
+}
+
+function updateCallQueuePos(callKey, pos) {
+  const card = document.querySelector(`[data-call="${callKey}"]`);
+  if (!card || callState[callKey]?.status === 'done' || callState[callKey]?.status === 'active') return;
+  const st = card.querySelector('.ac-st');
+  if (st) st.textContent = `#${pos+1} in queue`;
+}
+
+function appendChat(html) {
+  const body = $('chat-body');
+  const div = document.createElement('div');
+  div.innerHTML = html;
+  body.appendChild(div.firstElementChild || div);
+  // Scroll to bottom
+  $('panel-right').scrollTop = $('panel-right').scrollHeight;
+}
+
+function revealGhost(id) {
+  const el = $(id);
+  if (el) el.classList.add('revealed');
+}
+
+// ============================================================
+// WORKFLOW — drives the DAG via fetch calls
+// ============================================================
+async function startDemo() {
+  BASE_URL = $('inp-url').value.replace(/\/$/, '');
+  TOKEN = $('inp-token').value;
+  const prompt = $('inp-prompt').value;
+  if (!prompt) return alert('Enter a prompt');
+
+  // Reset UI
+  running = true;
+  abortCtrl = new AbortController();
+  completedCount = 0; latencies = []; startTime = Date.now();
+  $('st-pending').textContent = '0'; $('st-inflight').textContent = '0';
+  $('st-completed').textContent = '0'; $('st-latency').textContent = '—';
+  $('pending-list').innerHTML = ''; $('inflight-list').innerHTML = ''; $('completed-list').innerHTML = '';
+  $('ev-log').innerHTML = '';
+  $('chat-body').innerHTML = '';
+  $('idle-msg')?.remove();
+  $('btn-run').disabled = true; $('btn-run').style.display = 'none';
+  $('btn-stop').style.display = '';
+  ['plan','analysts','synth','review','final'].forEach(p => setPhase(p, ''));
+  $('pc-analysts').textContent = ''; $('pc-review').textContent = '';
+  Object.keys(callState).forEach(k => delete callState[k]);
+
+  try {
+    // Connect SSE
+    connectGlobalSSE();
+
+    // Create session
+    const sess = await api('POST', '/sessions');
+    mySessionId = sess.session_id;
+    // We need to figure out our int_id — it's returned implicitly via events.
+    // We'll sniff it from the first event that has our call_key.
+    myIntId = null;
+    $('my-session-label').textContent = '...';
+    $('chat-session-tag').textContent = mySessionId.slice(0,8);
+
+    connectSessionSSE(mySessionId);
+
+    // User message
+    appendChat(`<div class="msg msg-user">${escHtml(prompt)}</div>`);
+
+    const messages = [];
+
+    // ---- STEP 1: Plan ----
+    setPhase('plan', 'active');
+    appendChat(`<div><div class="msg-label"><span class="step-badge">step 1</span> orchestrator — plan</div><div class="msg msg-sys" id="msg-plan"><span class="typing"><i></i><i></i><i></i></span></div></div>`);
+
+    messages.push({role:'user', content:prompt});
+    const plan = await api('POST', `/sessions/${mySessionId}/completions`, {
+      call_type:'orchestrator', call_detail:'plan', messages: [...messages]
+    });
+    // Sniff int_id from events now
+    sniffIntId();
+    messages.push({role:'assistant', content:plan.content});
+    $('msg-plan').textContent = plan.content;
+    setPhase('plan', 'done');
+
+    // ---- STEP 2: Analysts (batch) ----
+    setPhase('analysts', 'active');
+    $('pc-analysts').textContent = '0/5'; $('pc-analysts').className = 'phase-count active';
+    let analystHtml = `<div><div class="msg-label"><span class="step-badge">step 2</span> Analysts — parallel research</div><div class="analyst-grid" id="analyst-grid">`;
+    ANALYSTS.forEach(name => {
+      const short = name.replace('analyst_','');
+      callState[name] = {status:'pending'};
+      analystHtml += `<div class="ac pending" data-call="${name}"><div class="ac-hd"><div class="ac-nm">${short}</div><div class="ac-st pending">pending</div></div><div class="ac-body"></div></div>`;
+    });
+    analystHtml += `</div></div>`;
+    appendChat(analystHtml);
+
+    const analystCalls = ANALYSTS.map(name => ({call_type:name, messages:[{role:'user',content:prompt}]}));
+    const analystResp = await api('POST', `/sessions/${mySessionId}/completions/batch`, {calls:analystCalls});
+    // Fill in any cards that weren't populated by SSE yet
+    analystResp.completions.forEach((c, i) => {
+      const key = ANALYSTS[i];
+      if (!callState[key]?.content) updateCallContent(key, c.content, i+1, ANALYSTS.length);
+    });
+    setPhase('analysts', 'done');
+    $('pc-analysts').textContent = '5/5';
+
+    const analystText = analystResp.completions.map((c,i) => `--- ${ANALYSTS[i]} ---\n${c.content}`).join('\n\n');
+    messages.push({role:'user', content:`Here are findings from 5 specialist analysts:\n\n${analystText}\n\nWrite a comprehensive draft synthesis of these findings.`});
+
+    // ---- STEP 3: Synthesize ----
+    setPhase('synth', 'active');
+    appendChat(`<div id="ghost-synth"><div class="msg-label"><span class="step-badge">step 3</span> orchestrator — synthesize</div><div class="msg msg-sys" id="msg-synth"><span class="typing"><i></i><i></i><i></i></span></div></div>`);
+
+    const synth = await api('POST', `/sessions/${mySessionId}/completions`, {
+      call_type:'orchestrator', call_detail:'synthesize', messages: [...messages]
+    });
+    messages.push({role:'assistant', content:synth.content});
+    $('msg-synth').textContent = synth.content.slice(0, 600) + (synth.content.length > 600 ? '...' : '');
+    setPhase('synth', 'done');
+
+    // ---- STEP 4: Reviewers (batch) ----
+    setPhase('review', 'active');
+    $('pc-review').textContent = '0/3'; $('pc-review').className = 'phase-count active';
+    let reviewHtml = `<div><div class="msg-label"><span class="step-badge">step 4</span> Reviewers — parallel review</div><div class="reviewer-grid" id="reviewer-grid">`;
+    REVIEWERS.forEach(name => {
+      const short = name.replace('review_','');
+      callState[name] = {status:'pending'};
+      reviewHtml += `<div class="ac pending" data-call="${name}"><div class="ac-hd"><div class="ac-nm">${short}</div><div class="ac-st pending">pending</div></div><div class="ac-body"></div></div>`;
+    });
+    reviewHtml += `</div></div>`;
+    appendChat(reviewHtml);
+
+    const reviewerCalls = REVIEWERS.map(name => ({call_type:name, messages:[{role:'user',content:synth.content}]}));
+    const reviewResp = await api('POST', `/sessions/${mySessionId}/completions/batch`, {calls:reviewerCalls});
+    reviewResp.completions.forEach((c, i) => {
+      const key = REVIEWERS[i];
+      if (!callState[key]?.content) updateCallContent(key, c.content, i+1, REVIEWERS.length);
+    });
+    setPhase('review', 'done');
+    $('pc-review').textContent = '3/3';
+
+    const reviewerText = reviewResp.completions.map((c,i) => `--- ${REVIEWERS[i]} ---\n${c.content}`).join('\n\n');
+    messages.push({role:'user', content:`Here is feedback from 3 reviewers:\n\n${reviewerText}\n\nIncorporate the feedback and produce your final polished synthesis.`});
+
+    // ---- STEP 5: Final ----
+    setPhase('final', 'active');
+    appendChat(`<div><div class="msg-label"><span class="step-badge">step 5</span> orchestrator — final synthesis</div><div class="msg msg-sys" id="msg-final"><span class="typing"><i></i><i></i><i></i></span></div></div>`);
+
+    const final = await api('POST', `/sessions/${mySessionId}/completions`, {
+      call_type:'orchestrator', call_detail:'final', messages: [...messages]
+    });
+    $('msg-final').textContent = final.content;
+    setPhase('final', 'done');
+
+    // Done
+    addEventLog('cmp', `Session complete — ${elapsed()}s total`);
+    appendChat(`<div style="text-align:center;padding:16px;font-size:12px;color:var(--green);font-family:var(--mono)">✓ Workflow complete — ${elapsed()}s · 11 LLM calls</div>`);
+
+    // Cleanup session
+    await api('DELETE', `/sessions/${mySessionId}`).catch(() => {});
+
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      addEventLog('fail', 'Demo stopped by user');
+    } else {
+      addEventLog('fail', err.message);
+      appendChat(`<div class="msg msg-sys" style="border-color:var(--coral);color:var(--coral)">Error: ${escHtml(err.message)}</div>`);
+    }
+  } finally {
+    running = false;
+    $('btn-run').disabled = false; $('btn-run').style.display = '';
+    $('btn-stop').style.display = 'none';
+  }
+}
+
+function stopDemo() {
+  if (abortCtrl) abortCtrl.abort();
+  if (globalSSE) { globalSSE.close(); globalSSE = null; }
+  if (sessionSSE) { sessionSSE.close(); sessionSSE = null; }
+  $('sse-dot').className = 'live-dot off';
+  running = false;
+  $('btn-run').disabled = false; $('btn-run').style.display = '';
+  $('btn-stop').style.display = 'none';
+}
+
+function sniffIntId() {
+  // Try to determine our int_id from the event log by matching session events.
+  // The session SSE will have events with our session_id.
+  // We'll also try from the latest queue snapshot.
+  if (myIntId !== null) return;
+  // Walk pending list looking for items with our call keys
+  const pending = document.querySelectorAll('#pending-list .q-item.hl');
+  if (pending.length > 0) {
+    const text = pending[0].querySelector('.q-session')?.textContent || '';
+    const match = text.match(/S(\d+)/);
+    if (match) {
+      myIntId = parseInt(match[1]);
+      $('my-session-label').textContent = `S${myIntId}`;
+    }
+  }
+}
+
+// Keep trying to sniff int_id
+setInterval(sniffIntId, 500);
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>

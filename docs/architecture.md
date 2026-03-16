@@ -48,13 +48,3 @@ cs244_march2/
 2. Pre-flight cost check (`sim/cost_tracker.py`)
 3. Submits to the active scheduler (`schedulers/`)
 4. Records actual cost after completion
-
-## Scheduler Feature Matrix
-
-| Scheduler | Queue | Group-Aware | Token Learning | Skip | Output Priority |
-|-----------|-------|-------------|----------------|------|-----------------|
-| Backoff | No (inline retry) | No | No | N/A | No |
-| FIFO | FIFO | No | No | No | No |
-| MapReduce | Priority (MR) | Yes | No | No | No |
-| MapReduce Skip | Priority (MR) | Yes | Yes (EMA) | Yes | No |
-| MapReduce Skip Adaptive | Priority (MR) | Yes | Yes (EMA) | Yes | Yes |
