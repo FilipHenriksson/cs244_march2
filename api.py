@@ -14,7 +14,11 @@ GET    /sim/stats                           – server-side metrics snapshot
 POST   /sim/reset                           – reset state for a fresh benchmark run
 GET    /sim/config                          – current server configuration
 PATCH  /sim/config                          – update config (max_tokens, rpm, tpm)
+
+Demo frontend endpoints
+-------------------------
 GET    /sim/events                          – SSE stream of global scheduler events (all sessions)
+GET    /sessions/{session_id}/events        – SSE stream of scheduler events for a specific session
 
 The server owns scheduling, rate limiting, and system-prompt caching.
 Clients drive their own agent loops and conversation state.
@@ -413,6 +417,37 @@ async def create_session():
     # Pre-create the session event bus so it's ready before any calls
     session_buses.get_or_create(int_id)
     return SessionResponse(session_id=sid)
+
+
+@app.get("/sessions/{session_id}/events")
+async def session_events(session_id: str):
+    """SSE stream of scheduler events for a specific session.
+
+    The stream emits events whenever one of this session's calls is
+    enqueued, dispatched, rate-limited, completed, or fails.
+
+    Auth: supports ``?token=<key>`` for browser EventSource compatibility.
+    """
+    int_id = _resolve_session(session_id)
+    bus = session_buses.get_or_create(int_id)
+    queue = bus.subscribe()
+
+    async def cleanup_generator():
+        try:
+            async for chunk in _sse_generator(queue):
+                yield chunk
+        finally:
+            bus.unsubscribe(queue)
+
+    return StreamingResponse(
+        cleanup_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
 
 
 @app.get("/sim/events", tags=["simulation"])
