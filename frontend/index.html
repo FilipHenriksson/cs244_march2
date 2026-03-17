@@ -148,6 +148,15 @@ body {
   font-weight: 600;
   letter-spacing: -0.04em;
 }
+.stats-subtitle {
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--tx3);
+  text-align: right;
+  margin-top: -6px;
+}
 
 /* ---------- Phase tracker ---------- */
 .phase-bar {
@@ -487,6 +496,74 @@ body {
 .typing i:nth-child(3) { animation-delay: .4s; }
 @keyframes blink { 0%,60%,100%{opacity:.3} 30%{opacity:1} }
 
+/* ---------- Completion banner ---------- */
+.completion-banner {
+  background: var(--surface);
+  border: 0.5px solid var(--green-b);
+  border-radius: 8px;
+  padding: 20px 24px;
+  text-align: center;
+  animation: banner-in 0.6s ease-out;
+}
+@keyframes banner-in {
+  0% { opacity: 0; transform: translateY(12px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+.completion-check {
+  width: 36px; height: 36px;
+  border-radius: 50%;
+  background: var(--green-bg);
+  border: 1.5px solid var(--green-b);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: var(--green);
+  margin-bottom: 10px;
+  animation: check-pop 0.4s ease-out 0.2s both;
+}
+@keyframes check-pop {
+  0% { transform: scale(0.5); opacity: 0; }
+  70% { transform: scale(1.15); }
+  100% { transform: scale(1); opacity: 1; }
+}
+.completion-title {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--tx);
+  margin-bottom: 8px;
+}
+.completion-stats {
+  display: flex;
+  justify-content: center;
+  gap: 20px;
+  margin-top: 10px;
+}
+.completion-stat {
+  text-align: center;
+}
+.completion-stat-val {
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.04em;
+}
+.completion-stat-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--tx3);
+  margin-top: 2px;
+}
+
+/* Phase bar done state */
+.phase-bar.all-done {
+  border-color: var(--green-b);
+  background: var(--green-bg);
+}
+
 /* ---------- Setup overlay ---------- */
 .setup-overlay {
   position: fixed;
@@ -599,6 +676,7 @@ body {
       <div class="stat-card"><div class="stat-label">Done</div><div class="stat-val" id="stat-done">0</div></div>
       <div class="stat-card"><div class="stat-label">Avg lat</div><div class="stat-val" id="stat-lat" style="color:var(--amber)">—</div></div>
     </div>
+    <div class="stats-subtitle">All sessions</div>
 
     <div class="phase-bar-label">Your session <span class="badge badge-you" id="my-session-badge" style="margin-left:4px">—</span></div>
     <div class="phase-bar" id="phase-bar"></div>
@@ -794,6 +872,7 @@ function connectSessionSSE() {
 // ================================================================
 async function runWorkflow(prompt) {
   const base = `/sessions/${MY_SESSION_ID}/completions`;
+  const workflowStart = performance.now();
 
   // Show user prompt in chat
   appendChat('user', prompt);
@@ -902,9 +981,53 @@ async function runWorkflow(prompt) {
   });
   finalMsg.textContent = finalResp.content;
   markPhaseDone('final');
+  currentPhase = null;  // All phases done
+
+  // Show completion banner
+  const elapsed = performance.now() - workflowStart;
+  const totalCalls = 3 + ANALYSTS.length + REVIEWERS.length;
+  showCompletionBanner(elapsed, totalCalls);
 
   // Cleanup
   await api('DELETE', `/sessions/${MY_SESSION_ID}`);
+}
+
+// ================================================================
+// Completion banner
+// ================================================================
+function showCompletionBanner(elapsedMs, totalCalls) {
+  const secs = (elapsedMs / 1000).toFixed(1);
+  const avgLat = latencies.length > 0
+    ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length)
+    : 0;
+
+  // Update phase bar to done state
+  document.getElementById('phase-bar').classList.add('all-done');
+
+  // Banner in chat panel
+  const body = document.getElementById('chat-body');
+  const banner = document.createElement('div');
+  banner.className = 'completion-banner';
+  banner.innerHTML = `
+    <div class="completion-check">\u2713</div>
+    <div class="completion-title">Workflow complete</div>
+    <div class="completion-stats">
+      <div class="completion-stat">
+        <div class="completion-stat-val" style="color:var(--green)">${secs}s</div>
+        <div class="completion-stat-label">Total time</div>
+      </div>
+      <div class="completion-stat">
+        <div class="completion-stat-val" style="color:var(--accent-hi)">${totalCalls}</div>
+        <div class="completion-stat-label">LLM calls</div>
+      </div>
+      <div class="completion-stat">
+        <div class="completion-stat-val" style="color:var(--amber)">${avgLat}ms</div>
+        <div class="completion-stat-label">Avg latency</div>
+      </div>
+    </div>
+  `;
+  body.appendChild(banner);
+  banner.scrollIntoView({ behavior: 'smooth', block: 'end' });
 }
 
 // ================================================================
