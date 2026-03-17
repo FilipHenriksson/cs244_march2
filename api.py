@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import uuid
+from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -58,6 +59,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from openai import AsyncOpenAI, APIConnectionError, BadRequestError, RateLimitError, APIError
 from pydantic import BaseModel
+
+from fastapi.responses import FileResponse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -288,6 +291,9 @@ def _check_auth(request: Request) -> bool:
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
+    # Dashboard serves the demo UI — no auth needed to load the page
+    if request.url.path == "/dashboard":
+        return await call_next(request)
     if not _check_auth(request):
         return Response(status_code=401, content="Unauthorized")
     return await call_next(request)
@@ -305,6 +311,7 @@ class RegisterCallTypeRequest(BaseModel):
 
 class SessionResponse(BaseModel):
     session_id: str
+    int_id: int
 
 
 class CompletionRequest(BaseModel):
@@ -416,7 +423,7 @@ async def create_session():
     }
     # Pre-create the session event bus so it's ready before any calls
     session_buses.get_or_create(int_id)
-    return SessionResponse(session_id=sid)
+    return SessionResponse(session_id=sid, int_id=int_id)
 
 
 @app.get("/sessions/{session_id}/events")
@@ -708,3 +715,12 @@ async def sim_reset(req: SimResetRequest | None = None):
         "status": "reset",
         "scheduler": _active_scheduler_name,
     }
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """Serve the demo frontend."""
+    return FileResponse(
+        Path(__file__).parent / "frontend" / "index.html",
+        media_type="text/html",
+    )

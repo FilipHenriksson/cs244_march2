@@ -230,7 +230,7 @@ body {
 
 .q-row {
   display: grid;
-  grid-template-columns: 22px 1fr 44px;
+  grid-template-columns: 30px 1fr 32px 44px;
   align-items: center;
   gap: 4px;
   padding: 5px 8px;
@@ -242,12 +242,32 @@ body {
 .q-row.mine {
   border-color: var(--accent-b);
   background: var(--accent-bg);
+  border-left: 2px solid var(--accent);
 }
 .q-pos {
   font-family: var(--mono);
   font-size: 10px;
   color: var(--tx3);
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  line-height: 1;
+}
+.q-arrow {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  animation: arrow-fade 2s ease-out forwards;
+}
+.q-arrow.up { color: var(--green); }
+.q-arrow.down { color: var(--red); }
+.q-arrow.new-item { color: var(--accent-hi); font-size: 8px; }
+@keyframes arrow-fade {
+  0% { opacity: 1; }
+  60% { opacity: 1; }
+  100% { opacity: 0; }
 }
 .q-info {
   display: flex;
@@ -274,6 +294,13 @@ body {
   font-size: 11px;
   text-align: right;
 }
+.q-sid {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tx3);
+  text-align: center;
+}
+.q-sid.mine-sid { color: var(--accent-hi); font-weight: 600; }
 .badge {
   display: inline-block;
   font-family: var(--mono);
@@ -298,7 +325,7 @@ body {
   border: 0.5px solid var(--border);
   border-radius: 5px;
 }
-.if-row.mine { border-color: var(--accent-b); background: var(--accent-bg); }
+.if-row.mine { border-color: var(--accent-b); background: var(--accent-bg); border-left: 2px solid var(--accent); }
 .if-elapsed {
   font-family: var(--mono);
   font-size: 10px;
@@ -568,7 +595,7 @@ body {
   <div class="panel-left">
     <div class="stats">
       <div class="stat-card"><div class="stat-label">Pending</div><div class="stat-val" id="stat-pending" style="color:var(--accent-hi)">0</div></div>
-      <div class="stat-card"><div class="stat-label">In flight</div><div class="stat-val" id="stat-inflight" style="color:var(--green)">0</div></div>
+      <div class="stat-card"><div class="stat-label">Dispatched</div><div class="stat-val" id="stat-inflight" style="color:var(--green)">0</div></div>
       <div class="stat-card"><div class="stat-label">Done</div><div class="stat-val" id="stat-done">0</div></div>
       <div class="stat-card"><div class="stat-label">Avg lat</div><div class="stat-val" id="stat-lat" style="color:var(--amber)">—</div></div>
     </div>
@@ -581,8 +608,8 @@ body {
     <div class="section-hd">Pending</div>
     <div id="pending-list"><div class="empty-state">No pending calls</div></div>
 
-    <div class="section-hd">In flight</div>
-    <div id="inflight-list"><div class="empty-state">Nothing in flight</div></div>
+    <div class="section-hd">Dispatched</div>
+    <div id="inflight-list"><div class="empty-state">Nothing dispatched</div></div>
   </div>
 
   <!-- Right panel: Chat output -->
@@ -883,14 +910,32 @@ async function runWorkflow(prompt) {
 // ================================================================
 // Queue rendering
 // ================================================================
+let prevPositions = {};  // itemKey -> position from last snapshot
+
+function itemKey(item) {
+  return `${item.session_id}:${item.call_key}:${item.enqueue_order}`;
+}
+
 function renderQueueSnapshot(data) {
+  // Pending is already sorted by priority desc, enqueue_order asc from the scheduler
   const pending = data.pending || [];
   const inflight = data.in_flight || [];
 
   document.getElementById('stat-pending').textContent = pending.length;
   document.getElementById('stat-inflight').textContent = inflight.length;
-  document.getElementById('meta-sessions').textContent =
-    new Set([...pending.map(p => p.session_id), ...inflight.map(f => f.session_id)]).size + ' sessions';
+
+  // Count unique sessions across pending + in-flight
+  const sessionSet = new Set([
+    ...pending.map(p => p.session_id),
+    ...inflight.map(f => f.session_id),
+  ]);
+  document.getElementById('meta-sessions').textContent = sessionSet.size + ' sessions';
+
+  // Build new position map for diffing
+  const newPositions = {};
+  pending.forEach((item, i) => {
+    newPositions[itemKey(item)] = i;
+  });
 
   // Pending list
   const pl = document.getElementById('pending-list');
@@ -899,35 +944,56 @@ function renderQueueSnapshot(data) {
   } else {
     pl.innerHTML = pending.map((item, i) => {
       const isMine = item.session_id === MY_INT_ID;
+      const key = itemKey(item);
+      const prev = prevPositions[key];
+
+      // Compute movement arrow
+      let arrowHtml = '';
+      if (prev === undefined) {
+        arrowHtml = '<span class="q-arrow new-item">new</span>';
+      } else if (prev !== i) {
+        if (i < prev) {
+          const delta = prev - i;
+          arrowHtml = `<span class="q-arrow up">\u25B2${delta}</span>`;
+        } else {
+          const delta = i - prev;
+          arrowHtml = `<span class="q-arrow down">\u25BC${delta}</span>`;
+        }
+      }
+
       const priColor = item.priority >= 0.9 ? 'var(--green)' :
                        item.priority >= 0.3 ? 'var(--amber)' : 'var(--red)';
-      const badge = isMine ? ' <span class="badge badge-you">you</span>' : '';
+
       return `<div class="q-row${isMine ? ' mine' : ''}">
-        <div class="q-pos">#${i + 1}</div>
+        <div class="q-pos">#${i + 1}${arrowHtml}</div>
         <div class="q-info">
           <span class="q-name">${escHtml(item.call_key)}</span>
-          <span class="q-session">S${item.session_id}${badge}</span>
+          ${isMine ? '<span class="badge badge-you">you</span>' : ''}
         </div>
+        <div class="q-sid${isMine ? ' mine-sid' : ''}">S${item.session_id}</div>
         <div class="q-pri" style="color:${priColor}">${item.priority.toFixed(2)}</div>
       </div>`;
     }).join('');
   }
 
+  // Save positions for next diff
+  prevPositions = newPositions;
+
   // In-flight list
   const fl = document.getElementById('inflight-list');
   if (inflight.length === 0) {
-    fl.innerHTML = '<div class="empty-state">Nothing in flight</div>';
+    fl.innerHTML = '<div class="empty-state">Nothing dispatched</div>';
   } else {
     const now = Date.now() / 1000;
     fl.innerHTML = inflight.map(item => {
       const isMine = item.session_id === MY_INT_ID;
       const elapsed = item.dispatched_at ? ((now - item.dispatched_at) * 1000) : 0;
       const elStr = elapsed < 1000 ? Math.round(elapsed) + 'ms' : (elapsed / 1000).toFixed(1) + 's';
-      const badge = isMine ? ' <span class="badge badge-you">you</span>' : '';
       return `<div class="if-row${isMine ? ' mine' : ''}">
         <div class="q-info">
           <span class="q-name">${escHtml(item.call_key)}</span>
-          <span class="q-session">S${item.session_id}${badge}</span>
+          ${isMine ? '<span class="badge badge-you">you</span>' : ''}
+          <span class="q-session">S${item.session_id}</span>
         </div>
         <div class="if-elapsed">${elStr}</div>
         <div class="bar-track"><div class="bar-fill"></div></div>
@@ -935,21 +1001,19 @@ function renderQueueSnapshot(data) {
     }).join('');
   }
 
-  // Update analyst card queue positions from pending data
+  // Update analyst/reviewer card queue positions from pending data
   if (currentPhase === 'analysts' || currentPhase === 'reviewers') {
     const names = currentPhase === 'analysts' ? ANALYSTS : REVIEWERS;
     names.forEach(name => {
       if (analystStatus[name] === 'pending') {
-        const inPending = pending.find(p => p.session_id === MY_INT_ID && p.call_key === name);
         const inFlight = inflight.find(f => f.session_id === MY_INT_ID && f.call_key === name);
         if (inFlight) {
           analystStatus[name] = 'active';
         }
-        // Update position display
+        const inPending = pending.find(p => p.session_id === MY_INT_ID && p.call_key === name);
         const el = document.getElementById('ac-status-' + name.replace(/[^a-z0-9]/g, '_'));
         if (el && inPending) {
-          const globalPos = pending.indexOf(inPending);
-          el.textContent = `#${globalPos + 1} in queue`;
+          el.textContent = `#${inPending.position + 1} in queue`;
         }
       }
     });

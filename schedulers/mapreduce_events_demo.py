@@ -18,7 +18,7 @@ class MapReduceWithEventsScheduler:
         self._drain_task: asyncio.Task | None = None
         self._enqueue_counter = 0
         self._session_active: dict[int, int] = {}
-        self._in_flight: dict[str, dict] = {}  # call_key:session_id -> info
+        self._in_flight: dict[str, dict] = {}  # flight_key -> info
 
     # --- Session tracking ---
 
@@ -64,25 +64,42 @@ class MapReduceWithEventsScheduler:
         session_buses.emit(session_id, event)
 
     def _build_queue_snapshot(self) -> dict:
-        """Build a snapshot of the current pending queue and in-flight calls."""
+        """Build a snapshot sorted by scheduler dispatch order.
+
+        Sorted by priority descending, then enqueue_order ascending —
+        exactly matching _pick_best() logic. Position 0 is the next
+        call that will be dispatched.
+
+        Each item includes enqueue_order as a stable identity key so
+        the frontend can track items across snapshots and show
+        movement arrows when priority reordering occurs.
+        """
         now = time.time()
         pending = []
-        for i, item in enumerate(self._pending):
+        for item in self._pending:
             session_id = item[3]
             pending.append({
-                "position": i,
                 "call_key": item[4],
                 "label": item[5],
                 "session_id": session_id,
                 "priority": round(self._compute_priority(session_id), 4),
                 "wait_ms": int((now - item[7]) * 1000),
                 "estimated_tokens": item[1],
+                "enqueue_order": item[6],
             })
+
+        # Sort to match _pick_best: highest priority first, then earliest arrival
+        pending.sort(key=lambda p: (-p["priority"], p["enqueue_order"]))
+
+        # Assign positions after sorting
+        for i, p in enumerate(pending):
+            p["position"] = i
+
         return {
             "type": "queue_snapshot",
             "pending": pending,
             "in_flight": list(self._in_flight.values()),
-            "pending_count": len(self._pending),
+            "pending_count": len(pending),
             "in_flight_count": len(self._in_flight),
         }
 
@@ -121,6 +138,7 @@ class MapReduceWithEventsScheduler:
             "queue_position": len(self._pending) - 1,
             "priority": round(self._compute_priority(session_id), 4),
             "estimated_tokens": estimated_tokens,
+            "enqueue_order": position,
         })
         # Snapshot after enqueue so all listeners see updated positions
         global_bus.emit(self._build_queue_snapshot())
@@ -199,6 +217,7 @@ class MapReduceWithEventsScheduler:
                 "label": label,
                 "session_id": session_id,
                 "dispatched_at": time.time(),
+                "enqueue_order": position,
             }
 
             # --- Event: call_dispatched ---
@@ -210,6 +229,7 @@ class MapReduceWithEventsScheduler:
                 "queue_wait_ms": int(queue_wait * 1000),
                 "rpm_waits": rpm_waits,
                 "tpm_waits": tpm_waits,
+                "enqueue_order": position,
             })
             # Snapshot after dispatch so positions update
             global_bus.emit(self._build_queue_snapshot())
