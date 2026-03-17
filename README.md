@@ -300,3 +300,19 @@ sim/
   trace.py                   Call logging and timeline visualization
   metrics.py                 Session statistics and comparison tables
 ```
+
+## AI Usage
+
+AI coding assistants (including Cursor and Claude Code) were used during development to help generate boilerplate code, refactor implementations, and accelerate debugging. These tools were also occasionally used for lightweight background research, such as sanity-checking whether certain scheduling strategies or design patterns were reasonable based on existing systems literature.
+
+All core research ideas — including the scheduling strategies, experimental methodology, evaluation criteria, and overall system architecture — were developed independently by the authors. AI tools were used as implementation accelerators rather than as sources of project direction.
+
+Specifically:
+
+- Scheduler designs and hypotheses were proposed before implementation
+- System architecture and experimental design were created manually
+- Testing plans and evaluation methodology were independently designed
+- Results analysis and conclusions were derived from our own experiments
+- AI suggestions were reviewed and validated before inclusion
+
+This project treats AI tools similarly to documentation, Stack Overflow, or traditional development tools: as productivity aids that accelerate implementation, not as substitutes for original research or engineering decisions.
