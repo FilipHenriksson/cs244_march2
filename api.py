@@ -292,7 +292,9 @@ def _check_auth(request: Request) -> bool:
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     # Dashboard serves the demo UI — no auth needed to load the page
-    if request.url.path == "/dashboard":
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if request.url.path in ("/dashboard", "/favicon.ico"):
         return await call_next(request)
     if not _check_auth(request):
         return Response(status_code=401, content="Unauthorized")
