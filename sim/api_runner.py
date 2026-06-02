@@ -417,8 +417,8 @@ def _parse_args():
                         help="HTTP request timeout in seconds (default: 1200)")
     parser.add_argument("--cooldown", type=float, default=5.0,
                         help="Seconds to sleep between scheduler runs (default: 5)")
-    parser.add_argument("--max-tokens", type=int, default=1024,
-                        help="Max tokens per completion; sets API server value once (default: 1024)")
+    parser.add_argument("--max-tokens", type=int, default=2048,
+                        help="Max tokens per completion; sets API server value once (default: 2048)")
     parser.add_argument("--rpm", type=int, default=None,
                         help="Requests per minute (updates API server rate limiter)")
     parser.add_argument("--tpm", type=int, default=None,
